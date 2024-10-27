@@ -155,7 +155,8 @@ def parse_percentage(value, total, video_height=None):
                 if video_height is None:
                     logging.error("Video height is required for vmin calculations")
                     return 0
-                return int((vmin_value / 100) * video_height)
+                # Divide vmin value by 2 for font sizes
+                return int((vmin_value / 200) * video_height)  # Changed from 100 to 200
             except ValueError:
                 logging.error(f"Invalid vmin value: {value}")
     logging.error(f"Invalid value for parsing: {value}")
@@ -479,28 +480,15 @@ def create_text_clip(element, video_width, video_height, total_duration):
             transparent=True
         ).set_duration(duration)
 
-        # Get the x_anchor value (default to "0%" if not specified)
-        x_anchor = element.get('x_anchor', "0%")
-        
         # Parse position percentages
-        x_percentage = element.get('x', "50%")
+        x_percentage = element.get('x', "0%")
         y_percentage = element.get('y', "0%")
         
-        # Calculate base x position
+        # Calculate positions - now using direct percentage without centering adjustment
         x_pos = parse_percentage(x_percentage, video_width)
-        
-        # If x is 50% (center), adjust position based on text width
-        if x_percentage == "50%":
-            x_pos = x_pos - (text_clip.w // 2)  # Center the text by subtracting half its width
-        else:
-            # For other cases, use anchor-based positioning
-            x_anchor_value = parse_percentage(x_anchor, text_clip.w)
-            x_pos = x_pos - x_anchor_value
-        
-        # Calculate y position
         final_y = parse_percentage(y_percentage, video_height)
 
-        logging.info(f"Text positioning - x: {x_pos}, y: {final_y}, text width: {text_clip.w}, anchor: {x_anchor}")
+        logging.info(f"Text positioning - x: {x_pos}, y: {final_y}, text width: {text_clip.w}")
 
         final_clip = text_clip.set_position((x_pos, final_y)).set_start(start_time)
         final_clip.name = element['id']
@@ -705,6 +693,8 @@ def generate_video(json_data):
     except Exception as e:
         logging.error(f"An unexpected error occurred during video generation: {str(e)}", exc_info=True)
         return None
+
+
 
 
 
