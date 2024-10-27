@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+moviepy
+Pillow
+requests
+numpy
+imageio
+opencv-python
+psutil
+ffmpy
+beautifulsoup4
+
+

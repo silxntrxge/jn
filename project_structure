@@ -1,0 +1,8 @@
+/json2video
+  /app
+    __init__.py
+    main.py
+    video_generator.py
+    webhook_sender.py
+  Dockerfile
+  requirements.txt
