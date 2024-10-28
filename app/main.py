@@ -4,6 +4,7 @@ from typing import List, Optional, Union
 from video_generator import generate_video
 from webhook_sender import send_webhook
 import os
+import logging
 
 app = FastAPI()
 
@@ -23,13 +24,16 @@ class SubElement(BaseModel):
     time: Optional[float] = None
     duration: Optional[float] = None
     source: Optional[str] = None
-    x: Optional[str] = None
-    y: Optional[str] = None
-    width: Optional[str] = None
-    height: Optional[str] = None
+    # Add default values for x and width
+    x: Optional[str] = "50%"  # Default center position
+    y: Optional[str] = "50%"
+    width: Optional[str] = "100%"  # Default full width
+    height: Optional[str] = "100%"
     x_anchor: Optional[str] = None
     y_anchor: Optional[str] = None
     fill_color: Optional[str] = None
+    stroke_color: Optional[str] = None
+    stroke_width: Optional[str] = None
     text: Optional[str] = None
     font_family: Optional[str] = None
     font_size: Optional[str] = None

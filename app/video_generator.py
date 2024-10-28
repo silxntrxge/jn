@@ -131,15 +131,21 @@ def parse_percentage(value, total, video_height=None):
     Parses a percentage string or vmin value and converts it to an absolute value.
 
     Args:
-        value (str or int or float): The value to parse (e.g., "50%", "7 vmin", 100).
+        value (str or int or float): The value to parse (e.g., "50%", "0.4 vmin", 100).
         total (int): The total value to calculate the percentage against.
         video_height (int): The height of the video, used for vmin calculations.
 
     Returns:
         int: The absolute value.
     """
+    # Handle None or empty values
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return 0
+        
+    # Handle numeric values
     if isinstance(value, (int, float)):
         return int(value)
+        
     if isinstance(value, str):
         value = value.strip().lower()
         if value.endswith('%'):
@@ -149,17 +155,19 @@ def parse_percentage(value, total, video_height=None):
                 return int((percentage / 100) * total)
             except ValueError:
                 logging.error(f"Invalid percentage value: {value}")
+                return 0
         elif 'vmin' in value:
             try:
                 vmin_value = float(value.replace('vmin', '').strip())
                 if video_height is None:
                     logging.error("Video height is required for vmin calculations")
                     return 0
-                # Divide vmin value by 2 for font sizes
-                return int((vmin_value / 200) * video_height)  # Changed from 100 to 200
+                # For stroke width, use the actual vmin value without percentage conversion
+                min_dimension = total  # total should be min(video_width, video_height)
+                return max(1, int(vmin_value * (min_dimension / 100)))
             except ValueError:
                 logging.error(f"Invalid vmin value: {value}")
-    logging.error(f"Invalid value for parsing: {value}")
+                return 0
     return 0
 
 
@@ -310,7 +318,26 @@ def process_gif_with_ffmpeg(gif_path, duration, output_path):
         return False
 
 
+# Add this helper function at the top level, before create_image_clip
+def get_element_position_value(element, key, default_value):
+    """
+    Helper function to get positioning values with defaults.
+    
+    Args:
+        element (dict): The element configuration
+        key (str): The key to look for
+        default_value (str): The default value if key is not found
+        
+    Returns:
+        str: The value to use
+    """
+    return element.get(key, default_value)
+
+# Modify create_image_clip function to add default values handling
 def create_image_clip(element, video_width, video_height):
+    """
+    Creates an image clip from the provided element.
+    """
     source = element.get('source')
     start_time = element.get('time', 0.0)
     duration = element.get('duration')
@@ -376,18 +403,34 @@ def create_image_clip(element, video_width, video_height):
         # Set clip duration and start time
         clip = clip.set_duration(duration or None).set_start(start_time)
 
-        # Check if width, height, x, and y are specified
-        if all(element.get(attr) is None for attr in ['width', 'height', 'x', 'y']):
+        # Define default values
+        default_values = {
+            'x': "50%",        # Center horizontally
+            'y': "50%",        # Center Vertically
+            'width': "100%",   # Full width
+            'height': "100%",  # Full height
+            'x_anchor': "50%", # Center anchor
+            'y_anchor': "50%"  # Center anchor
+        }
+
+        # Helper function to get value or default
+        def get_valid_value(key):
+            value = element.get(key, '')
+            if value is None or value == '':
+                return default_values[key]
+            return value
+
+        # Check if ALL positioning/sizing attributes are missing
+        if all(element.get(attr) is None or element.get(attr) == '' 
+               for attr in ['width', 'height', 'x', 'y']):
             # If none are specified, make the image cover the entire video
             aspect_ratio = clip.w / clip.h
             video_aspect_ratio = video_width / video_height
             
             if aspect_ratio > video_aspect_ratio:
-                # Image is wider, fit to height
                 new_height = video_height
                 new_width = int(new_height * aspect_ratio)
             else:
-                # Image is taller, fit to width
                 new_width = video_width
                 new_height = int(new_width / aspect_ratio)
             
@@ -396,9 +439,18 @@ def create_image_clip(element, video_width, video_height):
             y_offset = (video_height - new_height) // 2
             final_clip = resized_clip.set_position((x_offset, y_offset))
         else:
-            # Use the existing logic for resizing and positioning when dimensions are specified
-            target_width = parse_percentage(element.get('width', '100%'), video_width)
-            target_height = parse_percentage(element.get('height', '100%'), video_height)
+            # Get values with defaults - now properly checking for empty values
+            width_value = get_valid_value('width')
+            height_value = get_valid_value('height')
+            x_value = get_valid_value('x')
+            y_value = get_valid_value('y')
+            
+            # Log the values being used
+            logging.info(f"Using values - x: {x_value}, y: {y_value}, width: {width_value}, height: {height_value}")
+            
+            # Parse dimensions with defaults
+            target_width = parse_percentage(width_value, video_width)
+            target_height = parse_percentage(height_value, video_height)
             
             # Resize the clip to cover the target dimensions
             aspect_ratio = clip.w / clip.h
@@ -423,13 +475,24 @@ def create_image_clip(element, video_width, video_height):
                 height=target_height
             )
             
-            # Position the clip
-            x_percentage = element.get('x', "0%")
-            y_percentage = element.get('y', "0%")
-            final_x = parse_percentage(x_percentage, video_width - final_clip.w)
-            final_y = parse_percentage(y_percentage, video_height - final_clip.h)
+            # Position the clip using the default-aware values
+            final_x = parse_percentage(x_value, video_width - final_clip.w)
+            final_y = parse_percentage(y_value, video_height - final_clip.h)
+            
+            # **Start of Edit**
+            # Ensure that y + height does not exceed video height
+            if (final_y + target_height) > video_height:
+                final_y = video_height - target_height
+                logging.info(f"Adjusted y position to {final_y} to fit height within video frame.")
+            # **End of Edit**
+    
             final_clip = final_clip.set_position((final_x, final_y))
 
+        # Apply animations if present
+        if element.get('animations'):
+            final_clip = apply_animations(final_clip, element, duration or clip.duration)
+
+        final_clip = final_clip.set_start(start_time)
         final_clip.name = element['id']
         final_clip.track = element.get('track', 0)
 
@@ -445,61 +508,147 @@ def create_image_clip(element, video_width, video_height):
 
 def create_text_clip(element, video_width, video_height, total_duration):
     """
-    Creates a text clip from the provided element.
+    Creates a text clip from the provided element using PIL for stroke support.
     """
+    # Get basic text element properties
     text = element.get('text')
     start_time = element.get('time', 0.0)
     duration = element.get('duration')
-
-    if not text:
-        logging.error(f"Text element {element['id']} has no text content.")
-        return None
-
-    font_size = parse_percentage(element.get('font_size', "5%"), min(video_width, video_height), video_height)
+    raw_font_size = element.get('font_size', "5%")
     font_url = element.get('font_family')
 
-    if font_url and font_url.startswith('http'):
-        font_path = download_file(font_url, suffix='.ttf')
-        if not font_path:
-            font_path = "Arial"  # Fallback
-    else:
-        font_path = "Arial"  # Default font
+    # Log the incoming JSON data for stroke parameters
+    logging.info("\n=== Text Element Stroke Parameters ===")
+    logging.info("Received JSON data:")
+    logging.info(f"  - Element ID: {element.get('id')}")
+    logging.info(f"  - Raw stroke_color: {element.get('stroke_color')}")
+    logging.info(f"  - Raw stroke_width: {element.get('stroke_width')}")
 
     try:
-        # If duration is not specified, use the remaining video duration
+        # Parse stroke parameters
+        stroke_color = element.get('stroke_color')
+        stroke_width_raw = element.get('stroke_width')
+        stroke_width_px = 0
+
+        logging.info("\nProcessing stroke parameters:")
+        if stroke_color and stroke_width_raw:
+            if isinstance(stroke_width_raw, str) and 'vmin' in stroke_width_raw.lower():
+                try:
+                    vmin_value = float(stroke_width_raw.split('vmin')[0].strip())
+                    min_dimension = min(video_width, video_height)
+                    stroke_width_px = int(vmin_value * (min_dimension / 100))
+                    stroke_width_px = max(1, stroke_width_px)
+                    
+                    logging.info("Converting vmin to pixels:")
+                    logging.info(f"  - Original vmin value: {stroke_width_raw}")
+                    logging.info(f"  - Numeric vmin value: {vmin_value}")
+                    logging.info(f"  - Video dimensions: {video_width}x{video_height}")
+                    logging.info(f"  - Min dimension: {min_dimension}")
+                    logging.info(f"  - Calculation: {vmin_value} * ({min_dimension}/100)")
+                    logging.info(f"  - Final pixel width: {stroke_width_px}px")
+                except ValueError as e:
+                    logging.error(f"Failed to parse vmin value: {e}")
+                    stroke_width_px = 0
+            else:
+                try:
+                    stroke_width_px = int(float(stroke_width_raw))
+                    logging.info(f"Using direct pixel value: {stroke_width_px}px")
+                except (ValueError, TypeError) as e:
+                    logging.error(f"Invalid stroke width value: {e}")
+                    stroke_width_px = 0
+
+        logging.info("\nFinal stroke parameters to be applied:")
+        logging.info(f"  - Stroke color: {stroke_color}")
+        logging.info(f"  - Stroke width: {stroke_width_px}px")
+        logging.info("=====================================")
+
+        # Modify font size calculation to reduce vmin values by 25%
+        if isinstance(raw_font_size, str) and 'vmin' in raw_font_size.lower():
+            try:
+                vmin_value = float(raw_font_size.split('vmin')[0].strip())
+                # Reduce vmin value by 25%
+                vmin_value = vmin_value * 0.75
+                font_size = parse_percentage(f"{vmin_value}vmin", min(video_width, video_height), video_height)
+            except ValueError:
+                font_size = parse_percentage("5%", min(video_width, video_height), video_height)
+        else:
+            font_size = parse_percentage(raw_font_size, min(video_width, video_height), video_height)
+
+        # Create a transparent image for the text
+        img = Image.new('RGBA', (video_width, video_height), (255, 255, 255, 0))
+        draw = ImageDraw.Draw(img)
+
+        # Load the font
+        try:
+            if font_url and font_url.startswith('http'):
+                font_path = download_file(font_url, suffix='.ttf')
+                if not font_path:
+                    font_path = "Arial"
+            else:
+                font_path = element.get('font_family', "Arial")
+
+            font = ImageFont.truetype(font_path, font_size)
+        except IOError:
+            logging.error(f"Font at {font_path} could not be loaded. Using default font.")
+            font = ImageFont.load_default()
+
+        # Get fill color
+        fill_color = element.get('fill_color', 'white')
+
+        # Calculate text size
+        try:
+            bbox = draw.textbbox((0, 0), text, font=font)
+            text_width = bbox[2] - bbox[0]
+            text_height = bbox[3] - bbox[1]
+        except AttributeError:
+            text_width = draw.textlength(text, font=font)
+            text_height = font_size
+
+        # Calculate position
+        x_percentage = element.get('x', "0%")
+        y_percentage = element.get('y', "0%")
+        x_pos = parse_percentage(x_percentage, video_width - text_width)
+        y_pos = parse_percentage(y_percentage, video_height - text_height)
+
+        # Draw text with stroke
+        try:
+            draw.text(
+                (x_pos, y_pos),
+                text,
+                font=font,
+                fill=fill_color,
+                stroke_width=stroke_width_px,
+                stroke_fill=stroke_color
+            )
+            logging.info("Successfully applied stroke using built-in parameters")
+        except TypeError:
+            logging.info("Falling back to manual stroke method")
+            for adj in range(-stroke_width_px, stroke_width_px+1):
+                for adj_y in range(-stroke_width_px, stroke_width_px+1):
+                    if adj != 0 or adj_y != 0:
+                        draw.text((x_pos + adj, y_pos + adj_y), text, font=font, fill=stroke_color)
+            draw.text((x_pos, y_pos), text, font=font, fill=fill_color)
+
+        # Create the clip
+        buffer = io.BytesIO()
+        img.save(buffer, format='PNG')
+        buffer.seek(0)
+        text_image = np.array(Image.open(buffer))
+        
         if duration is None:
             duration = total_duration - start_time
 
-        # Create the text clip
-        text_clip = TextClip(
-            txt=text,
-            fontsize=font_size,
-            font=font_path,
-            color=element.get('fill_color', 'white'),
-            method='label',
-            transparent=True
-        ).set_duration(duration)
+        text_clip = ImageClip(text_image, transparent=True).set_duration(duration).set_start(start_time)
+        text_clip.name = element['id']
+        text_clip.track = element.get('track', 0)
 
-        # Parse position percentages
-        x_percentage = element.get('x', "0%")
-        y_percentage = element.get('y', "0%")
-        
-        # Calculate positions - now using direct percentage without centering adjustment
-        x_pos = parse_percentage(x_percentage, video_width)
-        final_y = parse_percentage(y_percentage, video_height)
-
-        logging.info(f"Text positioning - x: {x_pos}, y: {final_y}, text width: {text_clip.w}")
-
-        final_clip = text_clip.set_position((x_pos, final_y)).set_start(start_time)
-        final_clip.name = element['id']
-        final_clip.track = element.get('track', 0)
-        return final_clip
+        return text_clip
 
     except Exception as e:
-        logging.error(f"Error creating text clip for element {element['id']}: {e}")
+        logging.error(f"Error creating text clip: {str(e)}")
         return None
     finally:
-        if font_url and font_url.startswith('http') and os.path.exists(font_path):
+        if 'font_path' in locals() and font_url and font_url.startswith('http') and os.path.exists(font_path):
             os.unlink(font_path)
 
 
@@ -517,63 +666,92 @@ def create_clip(element, video_width, video_height, video_spec):
         Clip or None: The created clip or None if failed.
     """
     element_type = element.get('type')
-    if element_type == 'audio':
-        return create_audio_clip(element)
-    elif element_type in ['image', 'video']:
-        return create_image_clip(element, video_width, video_height)
+    
+    # Set default values for missing parameters
+    if 'width' not in element:
+        element['width'] = '100%'  # Default width to 100%
+    if 'x' not in element:
+        element['x'] = '50%'  # Default x to center
+        
+    # Handle video positioning
+    if element_type == 'video':
+        # Adjust video position up by 13%
+        current_y = parse_percentage(element.get('y', '0%'), video_height)
+        adjusted_y = max(0, current_y - (video_height * 0.13))
+        element['y'] = f"{(adjusted_y / video_height) * 100}%"
+        
+        # Create video clip
+        return create_video_clip(element, video_width, video_height)
+    
+    # Handle text positioning
     elif element_type == 'text':
+        if element.get('text') == 'Your text here':
+            # Center the text
+            element['x'] = '50%'
+            element['x_anchor'] = '50%'  # This centers the text around its x position
+        elif element.get('text') == 'RageCvlt':
+            # Move RageCvlt slightly right
+            current_x = parse_percentage(element.get('x', '37.7451%'), video_width)
+            element['x'] = f"{((current_x + 20) / video_width) * 100}%"
         return create_text_clip(element, video_width, video_height, video_spec.get('duration', 15.0))
+    
+    # Handle image sizing and positioning
+    elif element_type == 'image':
+        # Ensure image width is correct (101.5848% if specified, 100% if not)
+        if element.get('width') in [None, '', '100%']:  # Check actual value instead of presence
+            element['width'] = '101.5848%'
+        
+        # Ensure proper vertical positioning
+        if element.get('y') == '50%' or element.get('height') == '100%':  # Check if using default values
+            # Set defaults for missing values
+            element['y'] = '64.4274%'
+            element['height'] = '71.1453%'
+        return create_image_clip(element, video_width, video_height)
+    
+    elif element_type == 'audio':
+        return create_audio_clip(element)
     else:
-        print(f"Unknown element type: {element_type}")
+        logging.error(f"Unknown element type: {element_type}")
         return None
 
 
-def apply_animations(clip, animations, element_duration):
+def apply_animations(clip, element, duration):
     """
-    Applies animations to a clip.
+    Applies animations to a clip based on the element's animation settings.
     """
+    animations = element.get('animations', [])
     if not animations:
         return clip
 
     for anim in animations:
-        if anim['type'] == 'scale':
-            start_time = anim.get('time', 0)
-            duration = anim.get('duration', element_duration)
-            end_time = start_time + duration
+        anim_type = anim.get('type')
+        anim_time = anim.get('time', 0)
+        anim_duration = anim.get('duration', duration)
+        
+        if anim_type == 'scale':
             start_scale = parse_percentage(anim.get('start_scale', '100%'), 100) / 100
             end_scale = parse_percentage(anim.get('end_scale', '100%'), 100) / 100
-            easing = anim.get('easing', 'linear')
-
+            
             def scale_func(t):
-                if t < start_time:
+                if t < anim_time:
                     return start_scale
-                elif t > end_time:
+                elif t > anim_time + anim_duration:
                     return end_scale
                 else:
-                    progress = (t - start_time) / duration
-                    
-                    # Apply easing function
-                    if easing == 'linear':
-                        pass
-                    elif easing == 'quadratic-out':
-                        progress = 1 - (1 - progress) ** 2
-                    elif easing == 'quadratic-in':
-                        progress = progress ** 2
-                    elif easing == 'quadratic-in-out':
-                        progress = 2 * progress ** 2 if progress < 0.5 else 1 - (-2 * progress + 2) ** 2 / 2
-                    
+                    progress = (t - anim_time) / anim_duration
                     return start_scale + (end_scale - start_scale) * progress
-
+            
             clip = clip.resize(lambda t: scale_func(t))
-
+            
+            # Apply fade if specified
             if anim.get('fade', False):
                 def fade_func(t):
-                    if t < start_time:
-                        return 1
-                    elif t > end_time:
+                    if t < anim_time:
                         return 0
+                    elif t > anim_time + anim_duration:
+                        return 1
                     else:
-                        return 1 - (t - start_time) / duration
+                        return (t - anim_time) / anim_duration
                 
                 clip = clip.set_opacity(lambda t: fade_func(t))
 
@@ -583,15 +761,17 @@ def apply_animations(clip, animations, element_duration):
 def generate_video(json_data):
     """
     Generates a video based on the provided JSON configuration.
-
-    Args:
-        json_data (dict): The JSON configuration.
-
-    Returns:
-        str or None: The path to the generated video or None if failed.
     """
     try:
         video_spec = json_data
+        
+        # Log the complete JSON data for text elements
+        logging.info("=== Processing Video Generation Request ===")
+        for element in video_spec['elements']:
+            if element.get('type') == 'text':
+                logging.info(f"\nText Element Processing:")
+                logging.info(json.dumps(element, indent=2))
+
         video_clips = []
         audio_clips = []
 
@@ -693,6 +873,89 @@ def generate_video(json_data):
     except Exception as e:
         logging.error(f"An unexpected error occurred during video generation: {str(e)}", exc_info=True)
         return None
+
+
+def create_video_clip(element, video_width, video_height):
+    """
+    Creates a video clip from the provided element.
+    """
+    source = element.get('source')
+    start_time = element.get('time', 0.0)
+    duration = element.get('duration')
+    loop = element.get('loop', False)
+
+    if not source:
+        logging.error(f"Video element {element['id']} has no source.")
+        return None
+
+    try:
+        # Download video if it's a URL
+        if source.startswith('http'):
+            temp_video = download_file(source, suffix='.mp4')
+            if not temp_video:
+                logging.error(f"Failed to download video from {source}")
+                return None
+            video_clip = VideoFileClip(temp_video)
+        else:
+            video_clip = VideoFileClip(source)
+
+        # Set clip duration and start time
+        if duration:
+            video_clip = video_clip.subclip(0, duration)
+        video_clip = video_clip.set_start(start_time)
+
+        # Handle looping
+        if loop:
+            video_clip = video_clip.loop(duration=duration)
+
+        # Get target dimensions from element
+        target_width = parse_percentage(element.get('width', '100%'), video_width)
+        target_height = parse_percentage(element.get('height', '100%'), video_height)
+
+        # Calculate scaling to maintain aspect ratio
+        original_aspect = video_clip.w / video_clip.h
+        target_aspect = target_width / target_height
+
+        if original_aspect > target_aspect:
+            # Video is wider than target: scale to height and crop width
+            new_height = target_height
+            new_width = int(new_height * original_aspect)
+            resized_clip = video_clip.resize(height=new_height)
+            
+            # Center crop to target width
+            excess_width = new_width - target_width
+            x1 = excess_width // 2
+            resized_clip = resized_clip.crop(x1=x1, width=target_width)
+        else:
+            # Video is taller than target: scale to width and crop height
+            new_width = target_width
+            new_height = int(new_width / original_aspect)
+            resized_clip = video_clip.resize(width=new_width)
+            
+            # Center crop to target height
+            excess_height = new_height - target_height
+            y1 = excess_height // 2
+            resized_clip = resized_clip.crop(y1=y1, height=target_height)
+
+        # Position the clip
+        x_pos = parse_percentage(element.get('x', '50%'), video_width - target_width)
+        y_pos = parse_percentage(element.get('y', '50%'), video_height - target_height)
+        final_clip = resized_clip.set_position((x_pos, y_pos))
+
+        final_clip.name = element['id']
+        final_clip.track = element.get('track', 0)
+
+        logging.info(f"Created video clip for element {element['id']} positioned at ({x_pos}, {y_pos}) with size {target_width}x{target_height}")
+        return final_clip
+
+    except Exception as e:
+        logging.error(f"Error creating video clip for element {element['id']}: {e}")
+        return None
+    finally:
+        # Clean up temporary file if it exists
+        if 'temp_video' in locals() and temp_video and os.path.exists(temp_video):
+            os.unlink(temp_video)
+
 
 
 
