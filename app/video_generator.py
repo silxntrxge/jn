@@ -572,7 +572,7 @@ def create_text_clip(element, video_width, video_height, total_duration):
             try:
                 vmin_value = float(raw_font_size.split('vmin')[0].strip())
                 # Reduce vmin value by 25%
-                vmin_value = vmin_value * 0.75
+                vmin_value = vmin_value * 1
                 font_size = parse_percentage(f"{vmin_value}vmin", min(video_width, video_height), video_height)
             except ValueError:
                 font_size = parse_percentage("5%", min(video_width, video_height), video_height)
@@ -611,8 +611,8 @@ def create_text_clip(element, video_width, video_height, total_duration):
         # Calculate position
         x_percentage = element.get('x', "0%")
         y_percentage = element.get('y', "0%")
-        x_pos = parse_percentage(x_percentage, video_width - text_width)
-        y_pos = parse_percentage(y_percentage, video_height - text_height)
+        x_pos = parse_percentage(x_percentage, video_width)
+        y_pos = parse_percentage(y_percentage, video_height)
 
         # Draw text with stroke
         try:
@@ -661,33 +661,35 @@ def create_text_clip(element, video_width, video_height, total_duration):
 def create_clip(element, video_width, video_height, video_spec):
     """
     Creates a clip based on the element type.
-
-    Args:
-        element (dict): The JSON element.
-        video_width (int): The width of the video.
-        video_height (int): The height of the video.
-        video_spec (dict): The overall video specifications.
-
-    Returns:
-        Clip or None: The created clip or None if failed.
     """
     element_type = element.get('type')
     
+    # Get total duration from video spec
+    total_duration = video_spec.get('duration')
+    if total_duration is None:
+        logging.error("No duration specified in video specification")
+        return None
+    
     # Set default values for missing parameters
     if 'width' not in element:
-        element['width'] = '100%'  # Default width to 100%
+        element['width'] = '100%'
     if 'height' not in element:
-        element['height'] = '100%'  # Default height to 100%
+        element['height'] = '100%'
     if 'x' not in element:
-        element['x'] = '50%'  # Default x to center
+        element['x'] = '50%'
     if 'y' not in element:
-        element['y'] = '50%'  # Default y to center
+        element['y'] = '50%'
         
     # Handle different element types
     if element_type == 'video':
+        # If element has loop=True but no duration, set duration to total_duration
+        if element.get('loop', False) and not element.get('duration'):
+            element['duration'] = total_duration
+            # Store the total duration in the element for use in create_video_clip
+            element['total_duration'] = total_duration
         return create_video_clip(element, video_width, video_height)
     elif element_type == 'text':
-        return create_text_clip(element, video_width, video_height, video_spec.get('duration', 15.0))
+        return create_text_clip(element, video_width, video_height, total_duration)
     elif element_type == 'image':
         return create_image_clip(element, video_width, video_height)
     elif element_type == 'audio':
@@ -863,7 +865,7 @@ def create_video_clip(element, video_width, video_height):
     """
     source = element.get('source')
     start_time = element.get('time', 0.0)
-    duration = element.get('duration')
+    duration = element.get('duration')  # This might be None
     loop = element.get('loop', False)
 
     if not source:
@@ -874,21 +876,36 @@ def create_video_clip(element, video_width, video_height):
         # Download video if it's a URL
         if source.startswith('http'):
             temp_video_tuple = download_file(source, suffix='.mp4')
-            if not temp_video_tuple[0]:  # Check first element of tuple
+            if not temp_video_tuple[0]:
                 logging.error(f"Failed to download video from {source}")
                 return None
-            video_clip = VideoFileClip(temp_video_tuple[0])  # Use first element of tuple
+            video_clip = VideoFileClip(temp_video_tuple[0])
         else:
             video_clip = VideoFileClip(source)
 
-        # Set clip duration and start time
-        if duration:
-            video_clip = video_clip.subclip(0, duration)
-        video_clip = video_clip.set_start(start_time)
+        # If loop is True and duration is not specified,
+        # use the duration that was set in create_clip from video_spec
+        if loop and not duration:
+            duration = element.get('total_duration')  # This is set in create_clip
+            if not duration:
+                logging.error(f"No duration specified for looped video {element['id']}")
+                return None
 
-        # Handle looping
+        # Handle looping before any other modifications
         if loop:
-            video_clip = video_clip.loop(duration=duration)
+            # Calculate how many times we need to loop
+            original_duration = video_clip.duration
+            num_loops = math.ceil(duration / original_duration)
+            # Create the looped clip
+            video_clip = video_clip.loop(n=num_loops)
+            # Trim to exact duration if needed
+            video_clip = video_clip.set_duration(duration)
+        elif duration:
+            # If not looping but duration is specified, just trim
+            video_clip = video_clip.set_duration(duration)
+
+        # Set start time after handling loop/duration
+        video_clip = video_clip.set_start(start_time)
 
         # Get target dimensions from element with logging
         target_width = parse_percentage(element.get('width', '100%'), video_width)
