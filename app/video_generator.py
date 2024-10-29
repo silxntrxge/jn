@@ -33,6 +33,8 @@ from PIL import Image, ImageDraw, ImageFont
 from moviepy.config import change_settings
 from bs4 import BeautifulSoup
 import re
+import imghdr  # Import to check image type
+import mimetypes
 
 # Configure logging at the beginning of your script
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -87,43 +89,52 @@ def extract_image_url(url):
 def download_file(url, suffix=''):
     """
     Downloads a file from the specified URL to a temporary file.
-
-    Args:
-        url (str): The URL to download the file from.
-        suffix (str): The suffix for the temporary file.
-
-    Returns:
-        str: The path to the downloaded temporary file.
+    Returns tuple of (file_path, detected_extension)
     """
     try:
         # Get the direct download URL
         direct_url = extract_image_url(url)
         
-        # Add headers to mimic a browser request
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         }
         
         # Download the file
         response = requests.get(direct_url, stream=True, headers=headers)
         response.raise_for_status()
         
-        # Create temporary file
-        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+        # Create temporary file without extension first
+        temp_file = tempfile.NamedTemporaryFile(delete=False)
         
         # Write the content
         for chunk in response.iter_content(chunk_size=8192):
             if chunk:
                 temp_file.write(chunk)
         temp_file.close()
+
+        # Detect the actual file type
+        detected_type = imghdr.what(temp_file.name)
+        if detected_type:
+            actual_extension = f'.{detected_type}'
+        else:
+            # Fallback to content-type header
+            content_type = response.headers.get('content-type', '')
+            actual_extension = mimetypes.guess_extension(content_type) or suffix
+
+        # Rename the file with correct extension
+        new_path = f"{temp_file.name}{actual_extension}"
+        os.rename(temp_file.name, new_path)
         
         # Set permissions
-        os.chmod(temp_file.name, stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP | stat.S_IWGRP | stat.S_IROTH | stat.S_IWOTH)
+        os.chmod(new_path, stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP | stat.S_IWGRP | stat.S_IROTH | stat.S_IWOTH)
         
-        return temp_file.name
+        return new_path, actual_extension
+
     except Exception as e:
         logging.error(f"Error downloading file from {url}: {e}")
-        return None
+        if 'temp_file' in locals() and os.path.exists(temp_file.name):
+            os.unlink(temp_file.name)
+        return None, None
 
 
 def parse_percentage(value, total, video_height=None):
@@ -268,7 +279,7 @@ def create_audio_clip(element):
         print(f"Audio element {element['id']} has no source.")
         return None
 
-    temp_audio = download_file(source, suffix='.mp3')  # Assuming mp3, adjust if necessary
+    temp_audio, _ = download_file(source, suffix='.mp3')  # Now handling tuple return
     if not temp_audio:
         return None
 
@@ -290,7 +301,8 @@ def create_audio_clip(element):
         print(f"Error creating audio clip for element {element['id']}: {e}")
         return None
     finally:
-        os.unlink(temp_audio)
+        if temp_audio and os.path.exists(temp_audio):
+            os.unlink(temp_audio)
 
 
 def process_gif_with_ffmpeg(gif_path, duration, output_path):
@@ -348,20 +360,28 @@ def create_image_clip(element, video_width, video_height):
         logging.error(f"Image/GIF element {element['id']} has no source.")
         return None
 
-    temp_image = download_file(source)
+    temp_image, detected_ext = download_file(source)
     if not temp_image:
         logging.error(f"Failed to download file from {source} for element {element['id']}.")
         return None
 
     try:
-        if source.lower().endswith('.gif'):
-            # Handle GIF (existing GIF handling code remains the same)
+        # Check if the file is actually a GIF
+        is_gif = detected_ext.lower() == '.gif'
+        
+        if is_gif:
+            # Handle GIF
             gif = imageio.get_reader(temp_image)
             frames = []
             durations = []
-            for frame in gif:
-                frames.append(frame)
-                durations.append(frame.meta.get('duration', 100) / 1000)  # Convert to seconds
+            
+            try:
+                for frame in gif:
+                    frames.append(frame)
+                    durations.append(frame.meta.get('duration', 100) / 1000)  # Convert to seconds
+            except Exception as e:
+                logging.error(f"Error reading GIF frames: {e}")
+                return None
 
             original_duration = sum(durations)
             frame_count = len(frames)
@@ -387,7 +407,7 @@ def create_image_clip(element, video_width, video_height):
 
             clip = VideoClip(make_frame, duration=duration or total_duration)
         else:
-            # Handle static image (including transparent PNGs)
+            # Handle static image
             img = Image.open(temp_image)
             if img.mode in ('RGBA', 'LA') or (img.mode == 'P' and 'transparency' in img.info):
                 img = img.convert('RGBA')
@@ -439,16 +459,13 @@ def create_image_clip(element, video_width, video_height):
             y_offset = (video_height - new_height) // 2
             final_clip = resized_clip.set_position((x_offset, y_offset))
         else:
-            # Get values with defaults - now properly checking for empty values
+            # Get values with defaults
             width_value = get_valid_value('width')
             height_value = get_valid_value('height')
             x_value = get_valid_value('x')
             y_value = get_valid_value('y')
             
-            # Log the values being used
-            logging.info(f"Using values - x: {x_value}, y: {y_value}, width: {width_value}, height: {height_value}")
-            
-            # Parse dimensions with defaults
+            # Parse dimensions
             target_width = parse_percentage(width_value, video_width)
             target_height = parse_percentage(height_value, video_height)
             
@@ -475,18 +492,12 @@ def create_image_clip(element, video_width, video_height):
                 height=target_height
             )
             
-            # Position the clip using the default-aware values
-            final_x = parse_percentage(x_value, video_width - final_clip.w)
-            final_y = parse_percentage(y_value, video_height - final_clip.h)
+            # Calculate position directly from percentage without bounds checking
+            x_pos = parse_percentage(x_value, video_width)
+            y_pos = parse_percentage(y_value, video_height)
             
-            # **Start of Edit**
-            # Ensure that y + height does not exceed video height
-            if (final_y + target_height) > video_height:
-                final_y = video_height - target_height
-                logging.info(f"Adjusted y position to {final_y} to fit height within video frame.")
-            # **End of Edit**
-    
-            final_clip = final_clip.set_position((final_x, final_y))
+            # Position the clip without bounds checking - this allows elements to be outside
+            final_clip = final_clip.set_position((x_pos - target_width/2, y_pos - target_height/2))
 
         # Apply animations if present
         if element.get('animations'):
@@ -496,7 +507,6 @@ def create_image_clip(element, video_width, video_height):
         final_clip.name = element['id']
         final_clip.track = element.get('track', 0)
 
-        logging.info(f"Created {'GIF' if source.lower().endswith('.gif') else 'image'} clip for element {element['id']} positioned at {final_clip.pos} with size {final_clip.w}x{final_clip.h}.")
         return final_clip
 
     except Exception as e:
@@ -557,11 +567,6 @@ def create_text_clip(element, video_width, video_height, total_duration):
                     logging.error(f"Invalid stroke width value: {e}")
                     stroke_width_px = 0
 
-        logging.info("\nFinal stroke parameters to be applied:")
-        logging.info(f"  - Stroke color: {stroke_color}")
-        logging.info(f"  - Stroke width: {stroke_width_px}px")
-        logging.info("=====================================")
-
         # Modify font size calculation to reduce vmin values by 25%
         if isinstance(raw_font_size, str) and 'vmin' in raw_font_size.lower():
             try:
@@ -581,15 +586,14 @@ def create_text_clip(element, video_width, video_height, total_duration):
         # Load the font
         try:
             if font_url and font_url.startswith('http'):
-                font_path = download_file(font_url, suffix='.ttf')
-                if not font_path:
-                    font_path = "Arial"
+                font_path_tuple = download_file(font_url, suffix='.ttf')
+                font_path = font_path_tuple[0] if font_path_tuple[0] else "Arial"
             else:
                 font_path = element.get('font_family', "Arial")
 
             font = ImageFont.truetype(font_path, font_size)
         except IOError:
-            logging.error(f"Font at {font_path} could not be loaded. Using default font.")
+            logging.error(f"Font could not be loaded. Using default font.")
             font = ImageFont.load_default()
 
         # Get fill color
@@ -648,8 +652,10 @@ def create_text_clip(element, video_width, video_height, total_duration):
         logging.error(f"Error creating text clip: {str(e)}")
         return None
     finally:
-        if 'font_path' in locals() and font_url and font_url.startswith('http') and os.path.exists(font_path):
-            os.unlink(font_path)
+        # Clean up downloaded font file if it exists
+        if 'font_path_tuple' in locals() and font_url and font_url.startswith('http'):
+            if font_path_tuple[0] and os.path.exists(font_path_tuple[0]):
+                os.unlink(font_path_tuple[0])
 
 
 def create_clip(element, video_width, video_height, video_spec):
@@ -670,44 +676,20 @@ def create_clip(element, video_width, video_height, video_spec):
     # Set default values for missing parameters
     if 'width' not in element:
         element['width'] = '100%'  # Default width to 100%
+    if 'height' not in element:
+        element['height'] = '100%'  # Default height to 100%
     if 'x' not in element:
         element['x'] = '50%'  # Default x to center
+    if 'y' not in element:
+        element['y'] = '50%'  # Default y to center
         
-    # Handle video positioning
+    # Handle different element types
     if element_type == 'video':
-        # Adjust video position up by 13%
-        current_y = parse_percentage(element.get('y', '0%'), video_height)
-        adjusted_y = max(0, current_y - (video_height * 0.13))
-        element['y'] = f"{(adjusted_y / video_height) * 100}%"
-        
-        # Create video clip
         return create_video_clip(element, video_width, video_height)
-    
-    # Handle text positioning
     elif element_type == 'text':
-        if element.get('text') == 'Your text here':
-            # Center the text
-            element['x'] = '50%'
-            element['x_anchor'] = '50%'  # This centers the text around its x position
-        elif element.get('text') == 'RageCvlt':
-            # Move RageCvlt slightly right
-            current_x = parse_percentage(element.get('x', '37.7451%'), video_width)
-            element['x'] = f"{((current_x + 20) / video_width) * 100}%"
         return create_text_clip(element, video_width, video_height, video_spec.get('duration', 15.0))
-    
-    # Handle image sizing and positioning
     elif element_type == 'image':
-        # Ensure image width is correct (101.5848% if specified, 100% if not)
-        if element.get('width') in [None, '', '100%']:  # Check actual value instead of presence
-            element['width'] = '101.5848%'
-        
-        # Ensure proper vertical positioning
-        if element.get('y') == '50%' or element.get('height') == '100%':  # Check if using default values
-            # Set defaults for missing values
-            element['y'] = '64.4274%'
-            element['height'] = '71.1453%'
         return create_image_clip(element, video_width, video_height)
-    
     elif element_type == 'audio':
         return create_audio_clip(element)
     else:
@@ -891,11 +873,11 @@ def create_video_clip(element, video_width, video_height):
     try:
         # Download video if it's a URL
         if source.startswith('http'):
-            temp_video = download_file(source, suffix='.mp4')
-            if not temp_video:
+            temp_video_tuple = download_file(source, suffix='.mp4')
+            if not temp_video_tuple[0]:  # Check first element of tuple
                 logging.error(f"Failed to download video from {source}")
                 return None
-            video_clip = VideoFileClip(temp_video)
+            video_clip = VideoFileClip(temp_video_tuple[0])  # Use first element of tuple
         else:
             video_clip = VideoFileClip(source)
 
@@ -908,44 +890,62 @@ def create_video_clip(element, video_width, video_height):
         if loop:
             video_clip = video_clip.loop(duration=duration)
 
-        # Get target dimensions from element
+        # Get target dimensions from element with logging
         target_width = parse_percentage(element.get('width', '100%'), video_width)
         target_height = parse_percentage(element.get('height', '100%'), video_height)
+        
+        logging.info(f"Video dimensions: {video_width}x{video_height}")
+        logging.info(f"Target dimensions: {target_width}x{target_height}")
 
         # Calculate scaling to maintain aspect ratio
         original_aspect = video_clip.w / video_clip.h
         target_aspect = target_width / target_height
 
+        # Resize and crop to target dimensions
         if original_aspect > target_aspect:
             # Video is wider than target: scale to height and crop width
             new_height = target_height
             new_width = int(new_height * original_aspect)
-            resized_clip = video_clip.resize(height=new_height)
+            video_clip = video_clip.resize(height=new_height)
             
             # Center crop to target width
             excess_width = new_width - target_width
             x1 = excess_width // 2
-            resized_clip = resized_clip.crop(x1=x1, width=target_width)
+            video_clip = video_clip.crop(x1=x1, width=target_width)
         else:
             # Video is taller than target: scale to width and crop height
             new_width = target_width
             new_height = int(new_width / original_aspect)
-            resized_clip = video_clip.resize(width=new_width)
+            video_clip = video_clip.resize(width=new_width)
             
             # Center crop to target height
             excess_height = new_height - target_height
             y1 = excess_height // 2
-            resized_clip = resized_clip.crop(y1=y1, height=target_height)
+            video_clip = video_clip.crop(y1=y1, height=target_height)
 
-        # Position the clip
-        x_pos = parse_percentage(element.get('x', '50%'), video_width - target_width)
-        y_pos = parse_percentage(element.get('y', '50%'), video_height - target_height)
-        final_clip = resized_clip.set_position((x_pos, y_pos))
+        # Calculate positions using full dimensions without bounds checking
+        x_raw = element.get('x', '50%')
+        y_raw = element.get('y', '50%')
 
+        # Handle empty string cases
+        x_raw = '50%' if x_raw == '' else x_raw
+        y_raw = '50%' if y_raw == '' else y_raw
+
+        # Calculate positions directly from percentages
+        x_pos = parse_percentage(x_raw, video_width)
+        y_pos = parse_percentage(y_raw, video_height)
+
+        # Position relative to element center without bounds checking
+        x_pos_centered = x_pos - (target_width / 2)
+        y_pos_centered = y_pos - (target_height / 2)
+
+        # Set the position of the clip using the centered coordinates
+        final_clip = video_clip.set_position((x_pos_centered, y_pos_centered))
+        
         final_clip.name = element['id']
         final_clip.track = element.get('track', 0)
 
-        logging.info(f"Created video clip for element {element['id']} positioned at ({x_pos}, {y_pos}) with size {target_width}x{target_height}")
+        logging.info(f"Created video clip for element {element['id']} positioned at ({x_pos_centered}, {y_pos_centered}) with size {target_width}x{target_height}")
         return final_clip
 
     except Exception as e:
@@ -953,8 +953,8 @@ def create_video_clip(element, video_width, video_height):
         return None
     finally:
         # Clean up temporary file if it exists
-        if 'temp_video' in locals() and temp_video and os.path.exists(temp_video):
-            os.unlink(temp_video)
+        if 'temp_video_tuple' in locals() and temp_video_tuple[0] and os.path.exists(temp_video_tuple[0]):
+            os.unlink(temp_video_tuple[0])
 
 
 
