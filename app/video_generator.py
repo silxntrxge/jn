@@ -35,6 +35,7 @@ from bs4 import BeautifulSoup
 import re
 import imghdr  # Import to check image type
 import mimetypes
+import time
 
 # Configure logging at the beginning of your script
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -482,31 +483,52 @@ def create_image_clip(element, video_width, video_height):
             
             resized_clip = clip.resize(height=new_height, width=new_width)
             
-            # Crop to fit the target dimensions
-            x_center = resized_clip.w / 2
-            y_center = resized_clip.h / 2
-            final_clip = resized_clip.crop(
-                x1=x_center - target_width / 2,
-                y1=y_center - target_height / 2,
-                width=target_width,
-                height=target_height
-            )
-            
             # Calculate position directly from percentage without bounds checking
             x_pos = parse_percentage(x_value, video_width)
             y_pos = parse_percentage(y_value, video_height)
             
             # Position the clip without bounds checking - this allows elements to be outside
-            final_clip = final_clip.set_position((x_pos - target_width/2, y_pos - target_height/2))
+            final_clip = resized_clip.set_position((x_pos - target_width/2, y_pos - target_height/2))
 
-        # Apply animations if present
-        if element.get('animations'):
-            final_clip = apply_animations(final_clip, element, duration or clip.duration)
+            # If there are animations, adjust the initial position based on animation anchor points
+            if element.get('animations'):
+                final_clip = apply_animations(final_clip, element, duration or clip.duration, video_width, video_height)
 
         final_clip = final_clip.set_start(start_time)
         final_clip.name = element['id']
         final_clip.track = element.get('track', 0)
 
+        # Get the first scale animation if it exists
+        scale_anim = next((anim for anim in element.get('animations', []) 
+                          if anim.get('type') == 'scale'), None)
+        
+        if scale_anim:
+            # Get anchor points from animation
+            x_anchor = float(scale_anim.get('x_anchor', '50%').rstrip('%')) / 100
+            y_anchor = float(scale_anim.get('y_anchor', '50%').rstrip('%')) / 100
+            
+            # Calculate initial position based on anchor points
+            # For x=0: left edge of screen
+            # For x=0.5: center of screen
+            # For x=1: right edge of screen
+            x_pos = (video_width - final_clip.w) * x_anchor
+            y_pos = (video_height - final_clip.h) * y_anchor
+            
+            logging.info(f"""
+            Setting initial position:
+            Video dimensions: {video_width}x{video_height}
+            Element dimensions: {final_clip.w}x{final_clip.h}
+            Anchor points: x={x_anchor*100}%, y={y_anchor*100}%
+            Calculated position: {x_pos}, {y_pos}
+            """)
+            
+            # Set the initial position
+            final_clip = final_clip.set_position((x_pos, y_pos))
+        
+        # Apply animations (scaling will work from this initial position)
+        if element.get('animations'):
+            final_clip = apply_animations(final_clip, element, duration, video_width, video_height)
+            
         return final_clip
 
     except Exception as e:
@@ -608,11 +630,15 @@ def create_text_clip(element, video_width, video_height, total_duration):
             text_width = draw.textlength(text, font=font)
             text_height = font_size
 
-        # Calculate position
+        # Calculate position from the middle of the text
         x_percentage = element.get('x', "0%")
         y_percentage = element.get('y', "0%")
         x_pos = parse_percentage(x_percentage, video_width)
         y_pos = parse_percentage(y_percentage, video_height)
+
+        # Adjust position to center the text
+        x_pos = x_pos - (text_width / 2)
+        y_pos = y_pos - (text_height / 2)
 
         # Draw text with stroke
         try:
@@ -679,6 +705,10 @@ def create_clip(element, video_width, video_height, video_spec):
         element['x'] = '50%'
     if 'y' not in element:
         element['y'] = '50%'
+    
+    # Initialize animations as empty list if null
+    if element.get('animations') is None:
+        element['animations'] = []
         
     # Handle different element types
     if element_type == 'video':
@@ -699,48 +729,135 @@ def create_clip(element, video_width, video_height, video_spec):
         return None
 
 
-def apply_animations(clip, element, duration):
+def resize_maintaining_ratio(target_w, target_h, clip):
     """
-    Applies animations to a clip based on the element's animation settings.
+    Helper function to calculate dimensions that maintain aspect ratio while filling target area.
+    Scales to cover target area without warping, may result in cropping.
     """
+    clip_ratio = clip.w / clip.h
+    target_ratio = target_w / target_h
+
+    if clip_ratio > target_ratio:
+        # Image is wider - scale to height
+        new_height = target_h
+        new_width = int(new_height * clip_ratio)
+    else:
+        # Image is taller - scale to width
+        new_width = target_w
+        new_height = int(new_width / clip_ratio)
+
+    return new_width, new_height
+
+def apply_animations(clip, element, duration, video_width, video_height):
     animations = element.get('animations', [])
     if not animations:
         return clip
 
     for anim in animations:
-        anim_type = anim.get('type')
-        anim_time = anim.get('time', 0)
-        anim_duration = anim.get('duration', duration)
-        
-        if anim_type == 'scale':
-            start_scale = parse_percentage(anim.get('start_scale', '100%'), 100) / 100
-            end_scale = parse_percentage(anim.get('end_scale', '100%'), 100) / 100
+        try:
+            if anim.get('type') != 'scale':
+                continue
+
+            # Keep existing timing and scale values
+            element_start = element.get('time', 0)
+            anim_start = element_start + anim.get('time', 0)
+            anim_duration = anim.get('duration', duration)
+
+            start_scale = 0.05  
+            if anim.get('start_scale'):
+                start_scale = max(0.05, float(anim.get('start_scale', '5%').rstrip('%')) / 100)
+            end_scale = max(0.05, float(anim.get('end_scale', '100%').rstrip('%')) / 100)
             
-            def scale_func(t):
-                if t < anim_time:
-                    return start_scale
-                elif t > anim_time + anim_duration:
-                    return end_scale
-                else:
-                    progress = (t - anim_time) / anim_duration
-                    return start_scale + (end_scale - start_scale) * progress
-            
-            clip = clip.resize(lambda t: scale_func(t))
-            
-            # Apply fade if specified
-            if anim.get('fade', False):
-                def fade_func(t):
-                    if t < anim_time:
-                        return 0
-                    elif t > anim_time + anim_duration:
-                        return 1
-                    else:
-                        return (t - anim_time) / anim_duration
+            # Get anchor points
+            x_anchor = float(anim.get('x_anchor', '50%').strip('%')) / 100
+            y_anchor = float(anim.get('y_anchor', '50%').strip('%')) / 100
+
+            # Get element dimensions
+            element_w = parse_percentage(element.get('width', '100%'), video_width)
+            element_h = parse_percentage(element.get('height', '100%'), video_height)
+            element_x = parse_percentage(element.get('x', '50%'), video_width)
+            element_y = parse_percentage(element.get('y', '50%'), video_height)
+
+            def get_progress(t):
+                if t < anim_start:
+                    return 0
+                elif t > anim_start + anim_duration:
+                    return 1
+                return (t - anim_start) / anim_duration
+
+            def make_frame_resize(t):
+                progress = get_progress(t)
+                scale = start_scale + (end_scale - start_scale) * progress
+                scaled_w = element_w * scale
+                scaled_h = element_h * scale
+                return resize_maintaining_ratio(scaled_w, scaled_h, clip)
+
+            def make_frame_position(t):
+                current_w, current_h = make_frame_resize(t)
+                progress = get_progress(t)
                 
-                clip = clip.set_opacity(lambda t: fade_func(t))
+                # Calculate the scaling offset based on anchor point
+                width_diff = current_w - element_w
+                height_diff = current_h - element_h
+                
+                # Anchor point determines which side scales
+                x_offset = width_diff * x_anchor
+                y_offset = height_diff * y_anchor
+                
+                # Calculate position relative to anchor point
+                pos_x = element_x - (element_w / 2) - x_offset
+                pos_y = element_y - (element_h / 2) - y_offset
+                
+                return (pos_x, pos_y)
+
+            # Apply animations
+            clip = clip.resize(make_frame_resize)
+            clip = clip.set_position(make_frame_position)
+
+        except Exception as e:
+            logging.error(f"Error in animation for {element['id']}: {e}")
+            logging.error(f"Animation data: {anim}")
+            return clip
 
     return clip
 
+def get_easing_function(easing_type):
+    """
+    Returns an easing function based on the specified type.
+    """
+    def linear(t):
+        return t
+
+    def quadratic_out(t):
+        return t * (2 - t)
+
+    def quadratic_in(t):
+        return t * t
+
+    def quadratic_in_out(t):
+        if t < 0.5:
+            return 2 * t * t
+        return -1 + (4 - 2 * t) * t
+
+    def cubic_out(t):
+        return 1 - pow(1 - t, 3)
+
+    easing_functions = {
+        'linear': linear,
+        'quadratic-out': quadratic_out,
+        'quadratic-in': quadratic_in,
+        'quadratic-in-out': quadratic_in_out,
+        'cubic-out': cubic_out
+    }
+
+    return easing_functions.get(easing_type, linear)
+
+def easing_func(easing_type, progress):
+    """
+    Applies the easing function to the progress value.
+    """
+    func = get_easing_function(easing_type)
+    return func(progress)
 
 def generate_video(json_data):
     """
@@ -748,7 +865,7 @@ def generate_video(json_data):
     """
     try:
         video_spec = json_data
-        
+
         # Log the complete JSON data for text elements
         logging.info("=== Processing Video Generation Request ===")
         for element in video_spec['elements']:
@@ -783,7 +900,7 @@ def generate_video(json_data):
 
             # Force garbage collection after each element
             gc.collect()
-            
+
             # Log memory usage
             process = psutil.Process(os.getpid())
             logging.info(f"Memory usage after processing element {index + 1}: {process.memory_info().rss / 1024 / 1024:.2f} MB")
@@ -799,7 +916,6 @@ def generate_video(json_data):
             try:
                 # Create the final composite video
                 final_video = CompositeVideoClip(video_clips, size=(video_width, video_height), bg_color=None).set_duration(video_duration)
-                print("Created CompositeVideoClip with all video/image/GIF/text clips")
 
                 # Combine audio clips
                 if audio_clips:
@@ -846,6 +962,7 @@ def generate_video(json_data):
                     return None
             except Exception as e:
                 print(f"Error creating or writing the final video: {e}")
+                logging.error(f"Error creating or writing the final video: {e}", exc_info=True)
                 return None
         else:
             print("Error: No valid clips were created.")
@@ -859,60 +976,124 @@ def generate_video(json_data):
         return None
 
 
-def create_video_clip(element, video_width, video_height):
+def process_video_element(element, total_duration):
     """
-    Creates a video clip from the provided element.
+    Process a video element, handling looping and duration.
     """
-    source = element.get('source')
-    start_time = element.get('time', 0.0)
-    duration = element.get('duration')  # This might be None
-    loop = element.get('loop', False)
-
-    if not source:
-        logging.error(f"Video element {element['id']} has no source.")
-        return None
-
     try:
-        # Download video if it's a URL
+        source = element.get('source')
+        input_path = None
+        temp_video_tuple = None
+
         if source.startswith('http'):
             temp_video_tuple = download_file(source, suffix='.mp4')
             if not temp_video_tuple[0]:
                 logging.error(f"Failed to download video from {source}")
                 return None
-            video_clip = VideoFileClip(temp_video_tuple[0])
+            input_path = temp_video_tuple[0]
         else:
-            video_clip = VideoFileClip(source)
+            input_path = source
 
-        # If loop is True and duration is not specified,
-        # use the duration that was set in create_clip from video_spec
-        if loop and not duration:
-            duration = element.get('total_duration')  # This is set in create_clip
-            if not duration:
-                logging.error(f"No duration specified for looped video {element['id']}")
-                return None
+        element_duration = element.get('duration')
+        if element_duration is None:
+            element_duration = total_duration
 
-        # Handle looping before any other modifications
-        if loop:
-            # Calculate how many times we need to loop
-            original_duration = video_clip.duration
-            num_loops = math.ceil(duration / original_duration)
-            # Create the looped clip
-            video_clip = video_clip.loop(n=num_loops)
-            # Trim to exact duration if needed
-            video_clip = video_clip.set_duration(duration)
-        elif duration:
-            # If not looping but duration is specified, just trim
-            video_clip = video_clip.set_duration(duration)
+        if element.get('loop', False):
+            try:
+                # First, create a video clip to get its duration
+                original_clip = VideoFileClip(input_path)
+                original_duration = original_clip.duration
+                original_clip.close()
 
-        # Set start time after handling loop/duration
+                if element_duration:
+                    # Create a temporary file for concatenated video
+                    with tempfile.NamedTemporaryFile(suffix='.txt', mode='w', delete=False) as concat_list:
+                        # Calculate how many times to repeat the video
+                        num_loops = math.ceil(element_duration / original_duration)
+                        
+                        # Write the list of files to concatenate
+                        for _ in range(num_loops):
+                            concat_list.write(f"file '{input_path}'\n")
+                    
+                    # Create output path for concatenated video
+                    with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as output_file:
+                        output_path = output_file.name
+
+                    # Use ffmpeg concat demuxer
+                    ff = ffmpy.FFmpeg(
+                        inputs={concat_list.name: '-f concat -safe 0'},
+                        outputs={
+                            output_path: [
+                                '-c:v', 'libx264',
+                                '-preset', 'ultrafast',
+                                '-t', str(element_duration),
+                                '-y'
+                            ]
+                        }
+                    )
+                    ff.run()
+
+                    # Clean up concat list file
+                    os.unlink(concat_list.name)
+
+                    # Load the final video
+                    video_clip = VideoFileClip(output_path)
+                    
+                    # Clean up the output file after loading
+                    os.unlink(output_path)
+                    
+                    return video_clip
+                else:
+                    # No duration specified, use concatenation with total_duration
+                    video_clip = VideoFileClip(input_path)
+                    num_loops = int(np.ceil(total_duration / video_clip.duration))
+                    clips = [video_clip] * num_loops
+                    final_clip = concatenate_videoclips(clips)
+                    final_clip = final_clip.subclip(0, total_duration)
+                    return final_clip
+                    
+            except Exception as e:
+                logging.error(f"Error processing looped video: {str(e)}")
+                return VideoFileClip(input_path)
+        else:
+            # If not looping, just load and trim if needed
+            video_clip = VideoFileClip(input_path)
+            if element_duration:
+                video_clip = video_clip.subclip(0, min(element_duration, video_clip.duration))
+            return video_clip
+
+    except Exception as e:
+        logging.error(f"Error in process_video_element: {str(e)}")
+        return None
+    finally:
+        if temp_video_tuple and temp_video_tuple[0] and os.path.exists(temp_video_tuple[0]):
+            os.unlink(temp_video_tuple[0])
+
+# Modify create_video_clip to use process_video_element
+def create_video_clip(element, video_width, video_height):
+    """
+    Creates a video clip from the provided element.
+    """
+    if not element.get('source'):
+        logging.error(f"Video element {element['id']} has no source.")
+        return None
+
+    try:
+        # Process the video element first
+        total_duration = element.get('total_duration')
+        video_clip = process_video_element(element, total_duration)
+        
+        if video_clip is None:
+            return None
+
+        # Set start time and get duration
+        start_time = element.get('time', 0.0)
+        duration = element.get('duration', total_duration)
         video_clip = video_clip.set_start(start_time)
 
-        # Get target dimensions from element with logging
+        # Get target dimensions from element
         target_width = parse_percentage(element.get('width', '100%'), video_width)
         target_height = parse_percentage(element.get('height', '100%'), video_height)
-        
-        logging.info(f"Video dimensions: {video_width}x{video_height}")
-        logging.info(f"Target dimensions: {target_width}x{target_height}")
 
         # Calculate scaling to maintain aspect ratio
         original_aspect = video_clip.w / video_clip.h
@@ -920,58 +1101,46 @@ def create_video_clip(element, video_width, video_height):
 
         # Resize and crop to target dimensions
         if original_aspect > target_aspect:
-            # Video is wider than target: scale to height and crop width
             new_height = target_height
             new_width = int(new_height * original_aspect)
             video_clip = video_clip.resize(height=new_height)
-            
-            # Center crop to target width
             excess_width = new_width - target_width
             x1 = excess_width // 2
             video_clip = video_clip.crop(x1=x1, width=target_width)
         else:
-            # Video is taller than target: scale to width and crop height
             new_width = target_width
             new_height = int(new_width / original_aspect)
             video_clip = video_clip.resize(width=new_width)
-            
-            # Center crop to target height
             excess_height = new_height - target_height
             y1 = excess_height // 2
             video_clip = video_clip.crop(y1=y1, height=target_height)
 
-        # Calculate positions using full dimensions without bounds checking
+        # Calculate positions
         x_raw = element.get('x', '50%')
         y_raw = element.get('y', '50%')
-
-        # Handle empty string cases
         x_raw = '50%' if x_raw == '' else x_raw
         y_raw = '50%' if y_raw == '' else y_raw
-
-        # Calculate positions directly from percentages
         x_pos = parse_percentage(x_raw, video_width)
         y_pos = parse_percentage(y_raw, video_height)
 
-        # Position relative to element center without bounds checking
+        # Position relative to element center
         x_pos_centered = x_pos - (target_width / 2)
         y_pos_centered = y_pos - (target_height / 2)
 
-        # Set the position of the clip using the centered coordinates
+        # Set the position of the clip
         final_clip = video_clip.set_position((x_pos_centered, y_pos_centered))
-        
         final_clip.name = element['id']
         final_clip.track = element.get('track', 0)
 
-        logging.info(f"Created video clip for element {element['id']} positioned at ({x_pos_centered}, {y_pos_centered}) with size {target_width}x{target_height}")
+        # Apply animations if present
+        if element.get('animations'):
+            final_clip = apply_animations(final_clip, element, duration, video_width, video_height)
+
         return final_clip
 
     except Exception as e:
         logging.error(f"Error creating video clip for element {element['id']}: {e}")
         return None
-    finally:
-        # Clean up temporary file if it exists
-        if 'temp_video_tuple' in locals() and temp_video_tuple[0] and os.path.exists(temp_video_tuple[0]):
-            os.unlink(temp_video_tuple[0])
 
 
 

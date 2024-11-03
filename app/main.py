@@ -9,12 +9,17 @@ import logging
 app = FastAPI()
 
 class Animation(BaseModel):
-    easing: str
-    type: str
-    fade: bool
-    scope: str
-    end_scale: str
-    start_scale: str
+    """Model for animation properties"""
+    time: float = 0
+    duration: float
+    type: str  # e.g., 'scale'
+    easing: str = 'linear'  # e.g., 'quadratic-out', 'linear', etc.
+    start_scale: Optional[str] = '0%'  # e.g., '0%', '100%'
+    end_scale: Optional[str] = '100%'  # e.g., '100%', '110%'
+    x_anchor: Optional[str] = '50%'  # Default top-left
+    y_anchor: Optional[str] = '50%'  # Default top-left
+    axis: Optional[str] = 'both'  # 'x', 'y', or 'both'
+    fade: bool = False
 
 class SubElement(BaseModel):
     id: str
@@ -24,6 +29,8 @@ class SubElement(BaseModel):
     time: Optional[float] = None
     duration: Optional[float] = None
     source: Optional[str] = None
+    # Add loop parameter for video elements
+    loop: Optional[bool] = False
     # Add default values for x and width
     x: Optional[str] = "50%"  # Default center position
     y: Optional[str] = "50%"
@@ -37,6 +44,8 @@ class SubElement(BaseModel):
     text: Optional[str] = None
     font_family: Optional[str] = None
     font_size: Optional[str] = None
+    # Add animations field
+    animations: Optional[List[Animation]] = None
 
 class Element(SubElement):
     elements: Optional[List[SubElement]] = None
