@@ -470,38 +470,25 @@ def create_image_clip(element, video_width, video_height):
             target_width = parse_percentage(width_value, video_width)
             target_height = parse_percentage(height_value, video_height)
             
-            # Calculate scaling to maintain aspect ratio while filling the target area
+            # Resize the clip to cover the target dimensions
             aspect_ratio = clip.w / clip.h
             target_ratio = target_width / target_height
             
             if aspect_ratio > target_ratio:
-                # Image is wider than target area - scale to height and crop width
                 new_height = target_height
                 new_width = int(new_height * aspect_ratio)
-                resized_clip = clip.resize(height=new_height)
-                # Crop excess width from center
-                excess_width = new_width - target_width
-                x1 = excess_width // 2
-                resized_clip = resized_clip.crop(x1=x1, width=target_width)
             else:
-                # Image is taller than target area - scale to width and crop height
                 new_width = target_width
                 new_height = int(new_width / aspect_ratio)
-                resized_clip = clip.resize(width=new_width)
-                # Crop excess height from center
-                excess_height = new_height - target_height
-                y1 = excess_height // 2
-                resized_clip = resized_clip.crop(y1=y1, height=target_height)
-
-            # Calculate position
+            
+            resized_clip = clip.resize(height=new_height, width=new_width)
+            
+            # Calculate position directly from percentage without bounds checking
             x_pos = parse_percentage(x_value, video_width)
             y_pos = parse_percentage(y_value, video_height)
             
-            # Position relative to center
-            x_pos = x_pos - (target_width / 2)
-            y_pos = y_pos - (target_height / 2)
-            
-            final_clip = resized_clip.set_position((x_pos, y_pos))
+            # Position the clip without bounds checking - this allows elements to be outside
+            final_clip = resized_clip.set_position((x_pos - target_width/2, y_pos - target_height/2))
 
             # If there are animations, adjust the initial position based on animation anchor points
             if element.get('animations'):
@@ -761,95 +748,6 @@ def resize_maintaining_ratio(target_w, target_h, clip):
 
     return new_width, new_height
 
-# First, let's update the easing functions to be more precise
-def get_easing_function(easing_type):
-    """
-    Returns an easing function based on the specified type.
-    Implements standard easing functions for smooth animations.
-    """
-    def linear(t):
-        return t
-
-    def sinusoid_in(t):
-        return 1 - math.cos((t * math.pi) / 2)
-
-    def sinusoid_out(t):
-        return math.sin((t * math.pi) / 2)
-
-    def sinusoid_in_out(t):
-        return -(math.cos(math.pi * t) - 1) / 2
-
-    def quadratic_in(t):
-        return t * t
-
-    def quadratic_out(t):
-        return 1 - (1 - t) * (1 - t)
-
-    def quadratic_in_out(t):
-        if t < 0.5:
-            return 2 * t * t
-        return 1 - (-2 * t + 2)**2 / 2
-
-    def cubic_in(t):
-        return t * t * t
-
-    def cubic_out(t):
-        return 1 - (1 - t)**3
-
-    def cubic_in_out(t):
-        if t < 0.5:
-            return 4 * t * t * t
-        return 1 - (-2 * t + 2)**3 / 2
-
-    def quartic_in(t):
-        return t * t * t * t
-
-    def quartic_out(t):
-        return 1 - (1 - t)**4
-
-    def quartic_in_out(t):
-        if t < 0.5:
-            return 8 * t * t * t * t
-        return 1 - (-2 * t + 2)**4 / 2
-
-    def quintic_in(t):
-        return t * t * t * t * t
-
-    def quintic_out(t):
-        return 1 - (1 - t)**5
-
-    def quintic_in_out(t):
-        if t < 0.5:
-            return 16 * t * t * t * t * t
-        return 1 - (-2 * t + 2)**5 / 2
-
-    def exponential_in(t):
-        return 0 if t == 0 else math.pow(2, 10 * t - 10)
-
-    easing_functions = {
-        'linear': linear,
-        'sinusoid-in': sinusoid_in,
-        'sinusoid-out': sinusoid_out,
-        'sinusoid-in-out': sinusoid_in_out,
-        'quadratic-in': quadratic_in,
-        'quadratic-out': quadratic_out,
-        'quadratic-in-out': quadratic_in_out,
-        'cubic-in': cubic_in,
-        'cubic-out': cubic_out,
-        'cubic-in-out': cubic_in_out,
-        'quartic-in': quartic_in,
-        'quartic-out': quartic_out,
-        'quartic-in-out': quartic_in_out,
-        'quintic-in': quintic_in,
-        'quintic-out': quintic_out,
-        'quintic-in-out': quintic_in_out,
-        'exponential-in': exponential_in
-    }
-
-    # Add math import at the top of the file if not already present
-    return easing_functions.get(easing_type, linear)
-
-# Then modify the apply_animations function to use the easing
 def apply_animations(clip, element, duration, video_width, video_height):
     animations = element.get('animations', [])
     if not animations:
@@ -860,6 +758,7 @@ def apply_animations(clip, element, duration, video_width, video_height):
             if anim.get('type') != 'scale':
                 continue
 
+            # Keep existing timing and scale values
             element_start = element.get('time', 0)
             anim_start = element_start + anim.get('time', 0)
             anim_duration = anim.get('duration', duration)
@@ -869,13 +768,11 @@ def apply_animations(clip, element, duration, video_width, video_height):
                 start_scale = max(0.05, float(anim.get('start_scale', '5%').rstrip('%')) / 100)
             end_scale = max(0.05, float(anim.get('end_scale', '100%').rstrip('%')) / 100)
             
-            # Get easing function
-            easing_type = anim.get('easing', 'linear')
-            easing_function = get_easing_function(easing_type)
-            
+            # Get anchor points
             x_anchor = float(anim.get('x_anchor', '50%').strip('%')) / 100
             y_anchor = float(anim.get('y_anchor', '50%').strip('%')) / 100
 
+            # Get element dimensions
             element_w = parse_percentage(element.get('width', '100%'), video_width)
             element_h = parse_percentage(element.get('height', '100%'), video_height)
             element_x = parse_percentage(element.get('x', '50%'), video_width)
@@ -886,9 +783,7 @@ def apply_animations(clip, element, duration, video_width, video_height):
                     return 0
                 elif t > anim_start + anim_duration:
                     return 1
-                # Apply easing to the progress
-                linear_progress = (t - anim_start) / anim_duration
-                return easing_function(linear_progress)
+                return (t - anim_start) / anim_duration
 
             def make_frame_resize(t):
                 progress = get_progress(t)
@@ -901,17 +796,21 @@ def apply_animations(clip, element, duration, video_width, video_height):
                 current_w, current_h = make_frame_resize(t)
                 progress = get_progress(t)
                 
+                # Calculate the scaling offset based on anchor point
                 width_diff = current_w - element_w
                 height_diff = current_h - element_h
                 
+                # Anchor point determines which side scales
                 x_offset = width_diff * x_anchor
                 y_offset = height_diff * y_anchor
                 
+                # Calculate position relative to anchor point
                 pos_x = element_x - (element_w / 2) - x_offset
                 pos_y = element_y - (element_h / 2) - y_offset
                 
                 return (pos_x, pos_y)
 
+            # Apply animations
             clip = clip.resize(make_frame_resize)
             clip = clip.set_position(make_frame_position)
 
@@ -921,6 +820,44 @@ def apply_animations(clip, element, duration, video_width, video_height):
             return clip
 
     return clip
+
+def get_easing_function(easing_type):
+    """
+    Returns an easing function based on the specified type.
+    """
+    def linear(t):
+        return t
+
+    def quadratic_out(t):
+        return t * (2 - t)
+
+    def quadratic_in(t):
+        return t * t
+
+    def quadratic_in_out(t):
+        if t < 0.5:
+            return 2 * t * t
+        return -1 + (4 - 2 * t) * t
+
+    def cubic_out(t):
+        return 1 - pow(1 - t, 3)
+
+    easing_functions = {
+        'linear': linear,
+        'quadratic-out': quadratic_out,
+        'quadratic-in': quadratic_in,
+        'quadratic-in-out': quadratic_in_out,
+        'cubic-out': cubic_out
+    }
+
+    return easing_functions.get(easing_type, linear)
+
+def easing_func(easing_type, progress):
+    """
+    Applies the easing function to the progress value.
+    """
+    func = get_easing_function(easing_type)
+    return func(progress)
 
 def generate_video(json_data):
     """
