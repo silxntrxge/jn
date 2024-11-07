@@ -35,10 +35,16 @@ from bs4 import BeautifulSoup
 import re
 import imghdr  # Import to check image type
 import mimetypes
+from time import time as current_time  # Update the time import at the top
 import time
+from datetime import timedelta
+from concurrent.futures import ThreadPoolExecutor
+import subprocess
+import shutil
+import cv2
 
 # Configure logging at the beginning of your script
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Add the ImageMagick configuration after imports
 magick_home = os.environ.get('MAGICK_HOME', '/usr')
@@ -734,7 +740,8 @@ def create_clip(element, video_width, video_height, video_spec):
     elif element_type == 'text':
         return create_text_clip(element, video_width, video_height, total_duration)
     elif element_type == 'image':
-        return create_image_clip(element, video_width, video_height)
+        # Use the new OpenCV-based function for image clips
+        return create_image_clip_with_opencv(element, video_width, video_height)
     elif element_type == 'audio':
         return create_audio_clip(element)
     else:
@@ -927,137 +934,191 @@ def upload_video(file_path):
     Uploads video to 0x0.st and returns the URL.
     """
     try:
-        logging.info("Uploading video to 0x0.st...")
+        logging.info(f"Starting video upload from path: {file_path}")
+        logging.info(f"File size: {os.path.getsize(file_path) / (1024*1024):.2f} MB")
+        
         with open(file_path, 'rb') as file:
+            logging.info("Uploading to 0x0.st...")
             response = requests.post('https://0x0.st', files={'file': file})
+            
+            logging.info(f"Upload response status: {response.status_code}")
             if response.status_code == 200:
                 url = response.text.strip()
-                logging.info(f"Upload successful: {url}")
+                logging.info(f"Upload successful. URL: {url}")
                 return url
             else:
-                logging.error(f"Upload failed with status {response.status_code}")
+                logging.error(f"Upload failed. Response: {response.text}")
                 return None
     except Exception as e:
-        logging.error(f"Upload error: {e}")
+        logging.error(f"Upload error: {str(e)}", exc_info=True)
         return None
 
 def generate_video(json_data):
-    """
-    Generates a video based on the provided JSON configuration.
-    """
     try:
         video_spec = json_data
+        video_duration = float(video_spec.get('duration') or 15.0)
+        video_fps = float(video_spec.get('fps') or 30)
+        video_width = int(video_spec.get('width') or 720)
+        video_height = int(video_spec.get('height') or 1280)
 
-        # Log the complete JSON data for text elements
-        logging.info("=== Processing Video Generation Request ===")
-        for element in video_spec['elements']:
-            if element.get('type') == 'text':
-                logging.info(f"\nText Element Processing:")
-                logging.info(json.dumps(element, indent=2))
+        logging.info(f"\nVideo Specifications:")
+        logging.info(f"Duration: {video_duration}s")
+        logging.info(f"FPS: {video_fps}")
+        logging.info(f"Resolution: {video_width}x{video_height}")
 
-        video_clips = []
-        audio_clips = []
+        # Create temporary directory for assets
+        temp_dir = tempfile.mkdtemp()
+        output_path = os.path.join('/tmp', f"output_video_{uuid.uuid4().hex}.mp4")
+        logging.info(f"Created temp directory: {temp_dir}")
 
-        logging.info("Starting video generation process...")
-        logging.info(f"Video specification: {json.dumps(video_spec, indent=2)}")
+        try:
+            # Sort elements by track and time
+            elements = sorted(
+                video_spec['elements'], 
+                key=lambda x: (x.get('track', 0), x.get('time', 0))
+            )
 
-        # Set default values if not provided
-        video_duration = video_spec.get('duration', 15.0)
-        video_fps = video_spec.get('fps', 30)
-        video_width = video_spec.get('width', 720)
-        video_height = video_spec.get('height', 1280)
+            # Prepare FFmpeg inputs and filters
+            inputs = []
+            filter_complex = []
 
-        for index, element in enumerate(video_spec['elements']):
-            logging.info(f"Processing element {index + 1}/{len(video_spec['elements'])}: {json.dumps(element, indent=2)}")
-            clip = create_clip(element, video_width, video_height, video_spec)
-            if clip:
-                if isinstance(clip, AudioFileClip):
-                    audio_clips.append(clip)
-                    print(f"Added audio clip: {element['id']} on track {element.get('track', 0)}")
+            # Create background
+            filter_complex.append(
+                f'color=c=black:s={video_width}x{video_height}:'
+                f'd={video_duration}:r={video_fps}[bg]'
+            )
+            last_output = 'bg'
+
+            # Process each element
+            for i, element in enumerate(elements):
+                element_type = element.get('type')
+                start_time = float(element.get('time', 0.0))
+                element_duration = element.get('duration')
+                if element_duration is None:
+                    element_duration = video_duration - start_time
                 else:
-                    video_clips.append(clip)
-                    print(f"Added video/image/GIF/text clip: {element['id']} on track {element.get('track', 0)}")
-            else:
-                print(f"Failed to create clip for element: {element['id']}")
+                    element_duration = float(element_duration)
 
-            # Force garbage collection after each element
-            gc.collect()
+                if element_type in ['image', 'video']:
+                    clip = create_clip(element, video_width, video_height, video_spec)
+                    if not clip:
+                        continue
 
-            # Log memory usage
-            process = psutil.Process(os.getpid())
-            logging.info(f"Memory usage after processing element {index + 1}: {process.memory_info().rss / 1024 / 1024:.2f} MB")
+                    inputs.append(clip)
+                    input_idx = len(inputs) - 1
+                    next_output = f'[temp{i}]' if i < len(elements) - 1 else '[outv]'
+                    
+                    # Add setpts filter to ensure proper timing
+                    filter_complex.append(
+                        f'[{input_idx}:v]setpts=PTS-STARTPTS[v{i}];'
+                        f'[{last_output}][v{i}]overlay='
+                        f'shortest=0:enable=between(t\\,{start_time}\\,{start_time + element_duration})'
+                        f'{next_output}'
+                    )
+                    last_output = next_output.strip('[]')
 
-        print(f"Total video/image/GIF/text clips created: {len(video_clips)}")
-        print(f"Total audio clips created: {len(audio_clips)}")
+                elif element_type == 'text':
+                    next_output = f'[temp{i}]' if i < len(elements) - 1 else '[outv]'
+                    text = element.get('text', '')
+                    escaped_text = text.replace("'", "\\'").replace(':', '\\:')
+                    font_size = parse_percentage(element.get('font_size', '5%'), 
+                                              min(video_width, video_height), 
+                                              video_height)
+                    y_pos = parse_percentage(element.get('y', '50%'), video_height)
+                    
+                    drawtext_filter = (
+                        f'[{last_output}]drawtext=text=\'{escaped_text}\':'
+                        f'fontsize={font_size}:fontcolor={element.get("fill_color", "white")}:'
+                        f'x=(w-text_w)/2:y={y_pos}'
+                    )
+                    
+                    if element.get('stroke_color') and element.get('stroke_width'):
+                        stroke_width = parse_percentage(element.get('stroke_width', '0'), 
+                                                     min(video_width, video_height), 
+                                                     video_height)
+                        drawtext_filter += f':bordercolor={element["stroke_color"]}:borderw={stroke_width}'
+                    
+                    drawtext_filter += f':enable=between(t\\,{start_time}\\,{start_time + element_duration}){next_output}'
+                    
+                    filter_complex.append(drawtext_filter)
+                    last_output = next_output.strip('[]')
 
-        if video_clips or audio_clips:
-            # Sort video clips based on track number and start time
-            video_clips.sort(key=lambda c: (getattr(c, 'track', 0), getattr(c, 'start', 0)))
-            print("Sorted video/image/GIF/text clips based on track number and start time")
+            # Build FFmpeg command with loop options
+            ffmpeg_cmd = ['ffmpeg', '-y']
+            
+            # Add input files with stream loop
+            for input_file in inputs:
+                ffmpeg_cmd.extend(['-stream_loop', '-1', '-i', input_file])
 
-            try:
-                # Create the final composite video
-                final_video = CompositeVideoClip(video_clips, size=(video_width, video_height), bg_color=None).set_duration(video_duration)
+            # Add filter complex
+            filter_complex_str = ';'.join(filter_complex)
+            ffmpeg_cmd.extend([
+                '-filter_complex', filter_complex_str,
+                '-map', '[outv]',
+                '-c:v', 'libx264',
+                '-preset', 'ultrafast',
+                '-pix_fmt', 'yuv420p',
+                '-movflags', '+faststart',
+                '-profile:v', 'baseline',
+                '-level', '3.0',
+                '-t', str(video_duration)
+            ])
+            ffmpeg_cmd.append(output_path)
 
-                # Combine audio clips
-                if audio_clips:
-                    composite_audio = CompositeAudioClip(audio_clips)
-                    final_video = final_video.set_audio(composite_audio)
-                    print("Added CompositeAudioClip to the final video")
+            logging.info("Executing FFmpeg command:")
+            logging.info(' '.join(ffmpeg_cmd))
 
-                # Generate a unique filename for the output video
-                unique_filename = f"output_video_{uuid.uuid4().hex}.mp4"
-                desktop_path = os.path.expanduser("~/Desktop")
-                output_path = os.path.join(desktop_path, unique_filename)
+            # Execute FFmpeg
+            process = subprocess.Popen(
+                ffmpeg_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True
+            )
 
-                print(f"Attempting to write video file to: {output_path}")
+            # Monitor FFmpeg output
+            for line in process.stderr:
+                if 'error' in line.lower():
+                    logging.error(f"FFmpeg error: {line.strip()}")
+                elif 'warning' in line.lower():
+                    logging.warning(f"FFmpeg warning: {line.strip()}")
+                else:
+                    logging.debug(f"FFmpeg: {line.strip()}")
 
-                num_cores = multiprocessing.cpu_count()
-                ffmpeg_params = [
-                    "-preset", "ultrafast",
-                    "-crf", "23",
-                    "-tune", "fastdecode,zerolatency",
-                    "-movflags", "+faststart",
-                    "-bf", "0",
-                    "-flags:v", "+global_header",
-                    "-vf", "format=yuv420p",
-                    "-maxrate", "4M",
-                    "-bufsize", "4M",
-                    "-threads", str(num_cores)
-                ]
-
-                final_video.write_videofile(
-                    output_path,
-                    fps=video_fps,
-                    codec="libx264",
-                    audio_codec="aac",
-                    temp_audiofile='temp-audio.m4a',
-                    remove_temp=True,
-                    ffmpeg_params=ffmpeg_params
-                )
-
+            if process.wait() == 0:
+                # Verify the output video
                 if os.path.exists(output_path):
-                    # Upload and return just the URL
-                    url = upload_video(output_path)
-                    # Clean up the local file
-                    os.unlink(output_path)
-                    return url
+                    file_size = os.path.getsize(output_path)
+                    logging.info(f"Video generated successfully. Size: {file_size/1024/1024:.2f}MB")
+                    
+                    # Verify video can be opened
+                    cap = cv2.VideoCapture(output_path)
+                    if cap.isOpened():
+                        ret, frame = cap.read()
+                        if ret:
+                            logging.info("Video file verified - can be read correctly")
+                        else:
+                            logging.error("Video file verification failed - cannot read frames")
+                        cap.release()
+                    else:
+                        logging.error("Video file verification failed - cannot open file")
+                    
+                    return upload_video(output_path)
                 else:
-                    logging.error(f"Video file was not created at {output_path}")
+                    logging.error("Output video file not found")
                     return None
-            except Exception as e:
-                print(f"Error creating or writing the final video: {e}")
-                logging.error(f"Error creating or writing the final video: {e}", exc_info=True)
+            else:
+                logging.error("FFmpeg process failed")
                 return None
-        else:
-            print("Error: No valid clips were created.")
-            return None
 
-    except MemoryError:
-        logging.error("Out of memory error occurred. Try reducing video quality or duration.")
-        return None
+        finally:
+            # Cleanup
+            shutil.rmtree(temp_dir)
+            if os.path.exists(output_path):
+                os.unlink(output_path)
+
     except Exception as e:
-        logging.error(f"An unexpected error occurred during video generation: {str(e)}", exc_info=True)
+        logging.error(f"Error in video generation: {str(e)}", exc_info=True)
         return None
 
 
@@ -1156,77 +1217,402 @@ def process_video_element(element, total_duration):
 
 # Modify create_video_clip to use process_video_element
 def create_video_clip(element, video_width, video_height):
-    """
-    Creates a video clip from the provided element.
-    """
-    if not element.get('source'):
+    source = element.get('source')
+    if not source:
         logging.error(f"Video element {element['id']} has no source.")
         return None
 
-    try:
-        # Process the video element first
-        total_duration = element.get('total_duration')
-        video_clip = process_video_element(element, total_duration)
-        
-        if video_clip is None:
-            return None
-
-        # Set start time and get duration
-        start_time = element.get('time', 0.0)
-        duration = element.get('duration', total_duration)
-        video_clip = video_clip.set_start(start_time)
-
-        # Get target dimensions from element
-        target_width = parse_percentage(element.get('width', '100%'), video_width)
-        target_height = parse_percentage(element.get('height', '100%'), video_height)
-
-        # Calculate scaling to maintain aspect ratio
-        original_aspect = video_clip.w / video_clip.h
-        target_aspect = target_width / target_height
-
-        # Resize and crop to target dimensions
-        if original_aspect > target_aspect:
-            new_height = target_height
-            new_width = int(new_height * original_aspect)
-            video_clip = video_clip.resize(height=new_height)
-            excess_width = new_width - target_width
-            x1 = excess_width // 2
-            video_clip = video_clip.crop(x1=x1, width=target_width)
-        else:
-            new_width = target_width
-            new_height = int(new_width / original_aspect)
-            video_clip = video_clip.resize(width=new_width)
-            excess_height = new_height - target_height
-            y1 = excess_height // 2
-            video_clip = video_clip.crop(y1=y1, height=target_height)
-
-        # Calculate positions
-        x_raw = element.get('x', '50%')
-        y_raw = element.get('y', '50%')
-        x_raw = '50%' if x_raw == '' else x_raw
-        y_raw = '50%' if y_raw == '' else y_raw
-        x_pos = parse_percentage(x_raw, video_width)
-        y_pos = parse_percentage(y_raw, video_height)
-
-        # Position relative to element center
-        x_pos_centered = x_pos - (target_width / 2)
-        y_pos_centered = y_pos - (target_height / 2)
-
-        # Set the position of the clip
-        final_clip = video_clip.set_position((x_pos_centered, y_pos_centered))
-        final_clip.name = element['id']
-        final_clip.track = element.get('track', 0)
-
-        # Apply animations if present
-        if element.get('animations'):
-            final_clip = apply_animations(final_clip, element, duration, video_width, video_height)
-
-        return final_clip
-
-    except Exception as e:
-        logging.error(f"Error creating video clip for element {element['id']}: {e}")
+    temp_video, detected_ext = download_file(source)
+    if not temp_video:
+        logging.error(f"Failed to download video from {source}")
         return None
 
+    try:
+        # Get video dimensions
+        cap = cv2.VideoCapture(temp_video)
+        if not cap.isOpened():
+            logging.error("Failed to open video file")
+            return None
+
+        # Get video properties
+        orig_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        orig_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        
+        logging.info(f"Original video: {orig_width}x{orig_height} @ {fps}fps")
+
+        # Calculate target dimensions
+        target_height = parse_percentage(element.get('height', '100%'), video_height)
+        # If width not specified, calculate to maintain aspect ratio
+        if 'width' in element:
+            target_width = parse_percentage(element.get('width'), video_width)
+        else:
+            target_width = int(target_height * (orig_width / orig_height))
+
+        # Calculate scaling factors to maintain aspect ratio
+        width_scale = target_width / orig_width
+        height_scale = target_height / orig_height
+        
+        # Use the larger scale to ensure coverage (fit to cover)
+        scale = max(width_scale, height_scale)
+        
+        # Calculate new dimensions
+        new_width = int(orig_width * scale)
+        new_height = int(orig_height * scale)
+        
+        logging.info(f"Scaling to cover: {new_width}x{new_height}")
+
+        # Calculate crop offsets to center the video
+        x_crop = (new_width - target_width) // 2
+        y_crop = (new_height - target_height) // 2
+
+        # Create output video
+        output_path = f"{tempfile.mktemp()}.mp4"
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(output_path, fourcc, fps, (target_width, target_height))
+
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            # Resize frame maintaining aspect ratio
+            resized_frame = cv2.resize(frame, (new_width, new_height), interpolation=cv2.INTER_AREA)
+            
+            # Crop to target dimensions
+            cropped_frame = resized_frame[y_crop:y_crop+target_height, x_crop:x_crop+target_width]
+            
+            # Write the frame
+            out.write(cropped_frame)
+
+        cap.release()
+        out.release()
+
+        logging.info(f"Video clip created at: {output_path}")
+        return output_path
+
+    except Exception as e:
+        logging.error(f"Error creating video clip: {e}")
+        return None
+    finally:
+        if os.path.exists(temp_video):
+            os.unlink(temp_video)
+
+def monitor_resources():
+    cpu_percent = psutil.cpu_percent()
+    memory_info = psutil.Process().memory_info()
+    return {
+        'cpu_usage': cpu_percent,
+        'memory_usage': memory_info.rss / 1024 / 1024  # MB
+    }
+
+def monitor_rendering_progress(current_frame, total_frames):
+    """Monitor and log rendering progress with resource usage"""
+    if current_frame % 10 == 0:  # Log every 10 frames
+        progress = (current_frame / total_frames) * 100
+        cpu_percent = psutil.cpu_percent()
+        memory = psutil.Process().memory_info().rss / 1024 / 1024  # MB
+        
+        logging.info(f"Rendering progress: {progress:.1f}% | Frame: {current_frame}/{total_frames} | "
+                    f"CPU: {cpu_percent}% | Memory: {memory:.1f}MB")
+        
+        # Check if resources are strained
+        if cpu_percent > 90 or memory > (psutil.virtual_memory().total * 0.9):
+            logging.warning("Resource usage high during rendering, triggering GC")
+            gc.collect()
+
+def format_time(seconds):
+    """Format seconds into human readable time"""
+    return str(timedelta(seconds=int(seconds)))
+
+class RenderingProgress:
+    def __init__(self, total_frames):
+        self.total_frames = total_frames
+        self.start_time = current_time()
+        self.last_frame = 0
+        self.last_update = self.start_time
+        self.fps_samples = []
+        
+    def __call__(self, t):
+        current = current_time()
+        frame = int(t * self.total_frames)
+        elapsed = current - self.last_update
+        
+        # Update every 0.5 seconds
+        if elapsed > 0.5:
+            frames_processed = frame - self.last_frame
+            current_fps = frames_processed / elapsed if elapsed > 0 else 0
+            self.fps_samples.append(current_fps)
+            
+            # Keep only last 5 samples for average
+            if len(self.fps_samples) > 5:
+                self.fps_samples.pop(0)
+            
+            avg_fps = sum(self.fps_samples) / len(self.fps_samples)
+            progress = (frame / self.total_frames) * 100
+            
+            # Calculate ETA
+            frames_remaining = self.total_frames - frame
+            eta_seconds = frames_remaining / avg_fps if avg_fps > 0 else 0
+            
+            # Get resource usage
+            cpu_percent = psutil.cpu_percent()
+            memory = psutil.Process().memory_info().rss / 1024 / 1024
+            
+            logging.info(
+                f"Rendering: {progress:.1f}% | "
+                f"Frame: {frame}/{self.total_frames} | "
+                f"Speed: {avg_fps:.1f} fps | "
+                f"ETA: {format_time(eta_seconds)} | "
+                f"CPU: {cpu_percent}% | "
+                f"Memory: {memory:.1f}MB"
+            )
+            
+            self.last_frame = frame
+            self.last_update = current
+            
+            # Trigger GC if memory usage is high
+            if memory > psutil.virtual_memory().total * 0.8:
+                gc.collect()
+
+def create_image_clip_with_opencv(element, video_width, video_height):
+    """
+    Creates an image clip using OpenCV for animations.
+    """
+    source = element.get('source')
+    start_time = float(element.get('time', 0.0))
+    duration = float(element.get('duration', 5.0))
+    
+    logging.info(f"\nProcessing Image/GIF Element:")
+    for key, value in element.items():
+        logging.info(f"{key}: {value}")
+
+    if not source:
+        logging.error(f"Element {element['id']} has no source.")
+        return None
+
+    temp_file, detected_ext = download_file(source)
+    if not temp_file:
+        logging.error(f"Failed to download file from {source}")
+        return None
+
+    try:
+        # Check multiple ways if file is a GIF
+        is_gif = (
+            detected_ext.lower() == '.gif' or 
+            imghdr.what(temp_file) == 'gif' or
+            'gif' in source.lower() or
+            Image.open(temp_file).format == 'GIF'
+        )
+        
+        logging.info(f"File type detection: Extension={detected_ext}, Is GIF={is_gif}")
+
+        if is_gif:
+            logging.info("Processing as GIF animation")
+            try:
+                # Open GIF with PIL
+                gif = Image.open(temp_file)
+                frames = []
+                frame_count = 0
+                
+                while True:
+                    try:
+                        gif.seek(frame_count)
+                        # Convert frame to RGB and then to numpy array
+                        frame = gif.convert('RGB')
+                        frame_array = np.array(frame)
+                        # Convert from RGB to BGR for OpenCV
+                        frame_array = cv2.cvtColor(frame_array, cv2.COLOR_RGB2BGR)
+                        frames.append(frame_array)
+                        frame_count += 1
+                    except EOFError:
+                        break
+
+                logging.info(f"Successfully extracted {frame_count} frames from GIF")
+                
+                if not frames:
+                    logging.error("No frames extracted from GIF")
+                    return None
+                    
+                img = frames[0]  # Use first frame for initial sizing
+            except Exception as e:
+                logging.error(f"Error processing GIF: {e}")
+                return None
+        else:
+            # Regular image processing
+            img = cv2.imread(temp_file, cv2.IMREAD_UNCHANGED)
+            if img is None:
+                logging.error(f"Failed to read image from {temp_file}")
+                return None
+            frames = [img]  # Single frame for static images
+
+        # Get original image dimensions
+        img_height, img_width = img.shape[:2]
+        logging.info(f"Original image dimensions: {img_width}x{img_height}")
+
+        # Calculate dimensions based on percentages
+        width_value = element.get('width', '100%')
+        height_value = element.get('height', '100%')
+        x_value = element.get('x', '50%')
+        y_value = element.get('y', '50%')
+
+        # Calculate target dimensions
+        target_width = parse_percentage(width_value, video_width)
+        target_height = parse_percentage(height_value, video_height)
+        x_pos = parse_percentage(x_value, video_width)
+        y_pos = parse_percentage(y_value, video_height)
+
+        logging.info(f"Target dimensions: {target_width}x{target_height}")
+        logging.info(f"Position: ({x_pos}, {y_pos})")
+
+        # Calculate scaling factors
+        width_scale = target_width / img_width
+        height_scale = target_height / img_height
+        scale = max(width_scale, height_scale)
+        
+        # Calculate new dimensions
+        new_width = int(img_width * scale)
+        new_height = int(img_height * scale)
+        
+        logging.info(f"Scaling to cover: {new_width}x{new_height}")
+
+        # Resize and crop all frames
+        processed_frames = []
+        for frame in frames:
+            # Resize frame
+            resized_frame = cv2.resize(frame, (new_width, new_height), interpolation=cv2.INTER_AREA)
+            
+            # Calculate crop offsets
+            x_crop = (new_width - target_width) // 2
+            y_crop = (new_height - target_height) // 2
+            
+            # Crop frame
+            cropped_frame = resized_frame[y_crop:y_crop+target_height, x_crop:x_crop+target_width]
+            processed_frames.append(cropped_frame)
+
+        # Get animation parameters
+        animations = element.get('animations', [])
+        scale_animation = next((anim for anim in animations if anim.get('type') == 'scale'), None)
+        
+        if scale_animation:
+            anim_start = float(scale_animation.get('time', 0))
+            anim_duration = float(scale_animation.get('duration', duration))
+            end_scale = float(scale_animation.get('end_scale', '100').rstrip('%')) / 100
+            start_scale = max(0.01, float(scale_animation.get('start_scale', '100').rstrip('%')) / 100)
+            easing = scale_animation.get('easing', 'linear')
+            
+            # Get anchor points from animation (as percentages)
+            x_anchor_pct = float(scale_animation.get('x_anchor', '50%').rstrip('%')) / 100
+            y_anchor_pct = float(scale_animation.get('y_anchor', '50%').rstrip('%')) / 100
+            
+            logging.info(f"Animation anchors (relative to element): x={x_anchor_pct*100}%, y={y_anchor_pct*100}%")
+
+        # Calculate total frames needed for the full duration
+        fps = 30
+        total_frames = int(duration * fps)
+        frame_count = len(processed_frames)
+        
+        # Create output video
+        output_path = f"{tempfile.mktemp()}.mp4"
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(output_path, fourcc, fps, (video_width, video_height))
+
+        # Generate frames
+        for frame_num in range(total_frames):
+            frame_time = frame_num / fps
+            
+            # Create base frame
+            frame = np.zeros((video_height, video_width, 3), dtype=np.uint8)
+            
+            # Calculate current scale based on animation
+            current_scale = 1.0
+            if scale_animation and frame_time >= anim_start:
+                progress = min(1.0, (frame_time - anim_start) / anim_duration)
+                
+                # Apply easing
+                if easing == 'quadratic-out':
+                    progress = 1 - (1 - progress) ** 2
+                elif easing == 'quadratic-in':
+                    progress = progress ** 2
+                
+                current_scale = start_scale + (end_scale - start_scale) * progress
+                current_scale = max(0.01, current_scale)
+            
+            # Select base frame
+            if is_gif:
+                # If looping, use modulo to cycle through GIF frames
+                frame_idx = frame_num % frame_count
+                frame_img = processed_frames[frame_idx]
+            else:
+                # Use first frame for static image
+                frame_img = processed_frames[0]
+            
+            # Calculate scaled dimensions
+            scaled_width = int(target_width * current_scale)
+            scaled_height = int(target_height * current_scale)
+            
+            if scaled_width > 0 and scaled_height > 0:
+                # Scale the frame
+                scaled_img = cv2.resize(frame_img, (scaled_width, scaled_height), interpolation=cv2.INTER_LINEAR)
+                
+                if scale_animation:
+                    # Get the element's original position (this is the center point)
+                    element_center_x = x_pos
+                    element_center_y = y_pos
+                    
+                    # Calculate the anchor point offset from the center
+                    anchor_offset_x = (x_anchor_pct - 0.5) * target_width
+                    anchor_offset_y = (y_anchor_pct - 0.5) * target_height
+                    
+                    # Calculate the fixed anchor point in absolute coordinates
+                    anchor_x = element_center_x + anchor_offset_x
+                    anchor_y = element_center_y + anchor_offset_y
+                    
+                    # Calculate the scaled offset from anchor point
+                    x_offset = int(anchor_x - (scaled_width * x_anchor_pct))
+                    y_offset = int(anchor_y - (scaled_height * y_anchor_pct))
+                else:
+                    # Use center anchoring if no animation
+                    x_offset = int(x_pos - scaled_width // 2)
+                    y_offset = int(y_pos - scaled_height // 2)
+
+                # Ensure coordinates are within bounds
+                x_start = max(0, x_offset)
+                y_start = max(0, y_offset)
+                x_end = min(video_width, x_offset + scaled_width)
+                y_end = min(video_height, y_offset + scaled_height)
+
+                # Calculate ROI
+                roi_x_start = max(0, -x_offset)
+                roi_y_start = max(0, -y_offset)
+                roi_x_end = min(roi_x_start + (x_end - x_start), scaled_width)
+                roi_y_end = min(roi_y_start + (y_end - y_start), scaled_height)
+
+                if frame_num % fps == 0:  # Log every second
+                    logging.debug(f"Frame {frame_num}/{total_frames}: Scale={current_scale:.2f}, "
+                                f"Size={scaled_width}x{scaled_height}")
+
+                try:
+                    # Place image in frame
+                    frame[y_start:y_end, x_start:x_end] = scaled_img[roi_y_start:roi_y_end, roi_x_start:roi_x_end]
+                except Exception as e:
+                    logging.error(f"Error placing frame {frame_num}: {e}")
+                    continue
+
+            out.write(frame)
+
+        out.release()
+        logging.info(f"Video clip created at: {output_path}")
+        return output_path
+
+    except Exception as e:
+        logging.error(f"Error creating image/GIF clip: {e}")
+        return None
+    finally:
+        if os.path.exists(temp_file):
+            os.unlink(temp_file)
+
+# Replace the existing create_image_clip function call with create_image_clip_with_opencv
 
 
 

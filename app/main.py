@@ -5,6 +5,12 @@ from video_generator import generate_video
 from webhook_sender import send_webhook
 import os
 import logging
+import resource
+import gc
+import psutil
+import multiprocessing
+from concurrent.futures import ThreadPoolExecutor
+import math
 
 app = FastAPI()
 
@@ -57,25 +63,76 @@ class VideoRequest(BaseModel):
     duration: float
     snapshot_time: Optional[float] = None  # Make this optional
     elements: List[Union[SubElement, Element]]  # Allow both SubElement and Element
+    fps: Optional[int] = 30  # Added fps field to set frames per second
+
+# Set memory limits
+def set_memory_limits(soft_limit, hard_limit):
+    resource.setrlimit(resource.RLIMIT_AS, (soft_limit, hard_limit))
+
+# Periodic garbage collection
+gc.collect()
+
+def get_system_resources():
+    """Get available system resources"""
+    cpu_count = multiprocessing.cpu_count()
+    memory = psutil.virtual_memory()
+    return {
+        'cpu_cores': cpu_count,
+        'total_memory': memory.total,
+        'available_memory': memory.available,
+        'memory_percent': memory.percent
+    }
+
+def calculate_resource_limits():
+    """Calculate safe resource limits"""
+    resources = get_system_resources()
+    
+    # Leave 20% of resources for system
+    safe_memory = int(resources['available_memory'] * 0.8)
+    safe_cpu_cores = max(1, math.floor(resources['cpu_cores'] * 0.8))
+    
+    return {
+        'memory_limit': safe_memory,
+        'cpu_cores': safe_cpu_cores,
+        'worker_threads': safe_cpu_cores
+    }
 
 @app.post("/generate_video")
 async def create_video(request: VideoRequest, background_tasks: BackgroundTasks, x_webhook_url: str = Header(...)):
+    # Check available resources
+    resources = get_system_resources()
+    if resources['memory_percent'] > 90:
+        raise HTTPException(status_code=503, detail="System resources currently exhausted")
+    
+    # Calculate safe limits
+    limits = calculate_resource_limits()
+    
+    # Add resource limits to the request
+    request_dict = request.dict()
+    request_dict['resource_limits'] = limits
+    
     # Generate video in the background
-    background_tasks.add_task(process_video_request, request.dict(), x_webhook_url)
+    background_tasks.add_task(process_video_request, request_dict, x_webhook_url)
     return {"message": "Video generation started"}
 
 async def process_video_request(json_data: dict, webhook_url: str):
+    logging.info(f"Starting video generation with webhook URL: {webhook_url}")
     # Generate the video
-    video_path = generate_video(json_data)
+    video_url = generate_video(json_data)
     
-    if video_path:
+    if video_url:
         try:
+            logging.info(f"Video generated successfully, URL: {video_url}")
             # Send the video via webhook
-            send_webhook(webhook_url, video_path)
+            success = send_webhook(webhook_url, video_url)
+            if success:
+                logging.info(f"Webhook sent successfully to {webhook_url}")
+            else:
+                logging.error("Webhook sending failed")
         except Exception as e:
-            print(f"Error sending webhook: {str(e)}")
+            logging.error(f"Error sending webhook: {str(e)}", exc_info=True)
     else:
-        print("Video generation failed; webhook not sent.")
+        logging.error("Video generation failed; webhook not sent.")
 
 if __name__ == "__main__":
     import uvicorn

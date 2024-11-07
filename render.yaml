@@ -1,11 +1,10 @@
 services:
   - type: web
-    name: json2video
-    env: docker
-    dockerfilePath: ./Dockerfile
-    buildCommand: docker build -t json2video .
-    startCommand: docker run -p 8000:8000 -e PORT=8000 -e DEBUG=1 json2video
-    plan: free
-    maxmemoryPolicy: noeviction
-    memory: 512
-    timeout: 900  # 15 minutes timeout
+    name: web
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app/main.py
+    plan: standard # Upgrade for better resources
+    resources:
+      cpu: 1x    # Specify CPU units
+      memory: 512MB  # Specify RAM allocation

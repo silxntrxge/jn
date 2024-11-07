@@ -5,6 +5,8 @@ import random
 import string
 import time
 import logging
+import psutil
+import gc
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -52,25 +54,24 @@ def upload_to_0x0(file_path, max_retries=3):
             else:
                 raise Exception(f"Failed to upload file after {max_retries} attempts due to network errors.")
 
-def send_webhook(webhook_url, video_url):
+def send_webhook(webhook_url: str, video_url: str) -> bool:
     """
-    Sends a webhook with the video URL.
-
-    Args:
-        webhook_url (str): The URL to send the webhook to.
-        video_url (str): The URL of the generated video.
-
-    Returns:
-        bool: True if the webhook was sent successfully, False otherwise.
+    Sends a webhook with the video URL with resource monitoring.
     """
     try:
-        payload = {
-            "video_url": video_url
-        }
-        response = requests.post(webhook_url, json=payload)
+        # Monitor resources before sending
+        memory = psutil.virtual_memory()
+        if memory.percent > 90:
+            logging.warning("High memory usage before sending webhook")
+            gc.collect()  # Force garbage collection
+        
+        # Use a timeout to prevent hanging
+        response = requests.post(webhook_url, 
+                               json={"video_url": video_url},
+                               timeout=30)
         response.raise_for_status()
-        logging.info(f"Webhook sent successfully to {webhook_url}")
         return True
+        
     except requests.exceptions.RequestException as e:
         logging.error(f"Error sending webhook: {str(e)}")
         return False
